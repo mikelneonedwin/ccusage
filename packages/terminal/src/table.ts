@@ -1,26 +1,179 @@
 import process from 'node:process';
-import Table from 'cli-table3';
-import { uniq } from 'es-toolkit';
 import pc from 'picocolors';
-import stringWidth from 'string-width';
+import { getStringWidth } from './text-width.ts';
 
 /**
  * Default locale used for date formatting when not specified
  * en-CA provides YYYY-MM-DD ISO format
  */
 const DEFAULT_LOCALE = 'en-CA';
+let numberFormatter: Intl.NumberFormat | undefined;
+const formattedNumberCache = new Map<number, string>();
+const formattedModelNameCache = new Map<string, string>();
+const COLOR_RESET = '\x1B[39m';
 
-/**
- * Creates a date parts formatter with the specified timezone and locale
- * @param timezone - Timezone to use
- * @param locale - Locale to use for formatting
- * @returns Intl.DateTimeFormat instance
- */
-function createDatePartsFormatter(
-	timezone: string | undefined,
-	locale: string,
-): Intl.DateTimeFormat {
-	return new Intl.DateTimeFormat(locale, {
+function getNumberFormatter(): Intl.NumberFormat {
+	numberFormatter ??= new Intl.NumberFormat('en-US');
+	return numberFormatter;
+}
+
+function splitAnsiSequence(text: string, index: number): string | null {
+	if (text.charCodeAt(index) !== 27 || text.charCodeAt(index + 1) !== 91) {
+		return null;
+	}
+	let endIndex = index + 2;
+	while (endIndex < text.length) {
+		const code = text.charCodeAt(endIndex);
+		if (code >= 64 && code <= 126) {
+			return text.slice(index, endIndex + 1);
+		}
+		endIndex++;
+	}
+	return null;
+}
+
+function truncateToWidth(text: string, width: number): string {
+	return truncateToWidthWithMeasuredWidth(text, width).text;
+}
+
+function truncateToWidthWithMeasuredWidth(
+	text: string,
+	width: number,
+): {
+	text: string;
+	width: number;
+} {
+	const textWidth = getStringWidth(text);
+	if (textWidth <= width) {
+		return { text, width: textWidth };
+	}
+	if (width <= 1) {
+		return { text: '…', width: 1 };
+	}
+
+	const targetWidth = width - 1;
+	let visibleWidth = 0;
+	let output = '';
+	let hasAnsi = false;
+	for (let index = 0; index < text.length; ) {
+		const ansiSequence = splitAnsiSequence(text, index);
+		if (ansiSequence != null) {
+			output += ansiSequence;
+			index += ansiSequence.length;
+			hasAnsi = true;
+			continue;
+		}
+
+		const codePoint = text.codePointAt(index);
+		if (codePoint == null) {
+			break;
+		}
+		const char = String.fromCodePoint(codePoint);
+		const charWidth = codePoint < 0x80 ? 1 : getStringWidth(char);
+		if (visibleWidth + charWidth > targetWidth) {
+			break;
+		}
+		output += char;
+		visibleWidth += charWidth;
+		index += char.length;
+	}
+
+	return { text: `${output}…${hasAnsi ? COLOR_RESET : ''}`, width };
+}
+
+function padToWidth(text: string, width: number, align: TableCellAlign): string {
+	const truncated = truncateToWidthWithMeasuredWidth(text, width);
+	const padding = Math.max(0, width - truncated.width);
+	switch (align) {
+		case 'right':
+			return `${' '.repeat(padding)}${truncated.text}`;
+		case 'center': {
+			const left = Math.floor(padding / 2);
+			return `${' '.repeat(left)}${truncated.text}${' '.repeat(padding - left)}`;
+		}
+		case 'left':
+			return `${truncated.text}${' '.repeat(padding)}`;
+	}
+}
+
+function wrapHeaderLine(text: string, width: number): string[] {
+	if (getStringWidth(text) <= width) {
+		return [text];
+	}
+
+	const words = text.split(' ');
+	if (words.length <= 1) {
+		return [truncateToWidth(text, width)];
+	}
+
+	const lines: string[] = [];
+	let current = '';
+	for (const word of words) {
+		const candidate = current === '' ? word : `${current} ${word}`;
+		if (getStringWidth(candidate) <= width) {
+			current = candidate;
+		} else {
+			if (current !== '') {
+				lines.push(current);
+			}
+			current = getStringWidth(word) <= width ? word : truncateToWidth(word, width);
+		}
+	}
+	if (current !== '') {
+		lines.push(current);
+	}
+	return lines;
+}
+
+function wrapCellLine(text: string, width: number): string[] {
+	if (getStringWidth(text) <= width) {
+		return [text];
+	}
+
+	const words = text.split(' ');
+	if (words.length <= 1) {
+		return [truncateToWidth(text, width)];
+	}
+
+	const lines: string[] = [];
+	let current = '';
+	for (const word of words) {
+		const candidate = current === '' ? word : `${current} ${word}`;
+		if (getStringWidth(candidate) <= width) {
+			current = candidate;
+			continue;
+		}
+
+		if (current !== '') {
+			lines.push(current);
+		}
+		current =
+			word === '' ? '' : getStringWidth(word) <= width ? word : truncateToWidth(word, width);
+	}
+
+	if (current !== '') {
+		lines.push(current);
+	}
+	return lines.length === 0 ? [''] : lines;
+}
+
+function splitCellContent(content: string): string[] {
+	return content.split('\n');
+}
+
+function stringifyCell(cell: TableRow[number] | undefined): string {
+	if (typeof cell === 'object' && cell != null && 'content' in cell) {
+		return String(cell.content);
+	}
+	return String(cell ?? '');
+}
+
+function formatDateParts(year: number, month: number, day: number): string {
+	return `${year.toString().padStart(4, '0')}\n${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
+}
+
+function createDatePartsFormatter(timezone: string | undefined): Intl.DateTimeFormat {
+	return new Intl.DateTimeFormat(DEFAULT_LOCALE, {
 		year: 'numeric',
 		month: '2-digit',
 		day: '2-digit',
@@ -32,20 +185,27 @@ function createDatePartsFormatter(
  * Formats a date string to compact format with year on first line and month-day on second
  * @param dateStr - Input date string (YYYY-MM-DD or ISO timestamp)
  * @param timezone - Timezone to use for formatting (pass undefined to use system timezone)
- * @param locale - Locale to use for formatting (defaults to sv-SE for YYYY-MM-DD format)
  * @returns Formatted date string with newline separator (YYYY\nMM-DD)
  */
-export function formatDateCompact(dateStr: string, timezone?: string, locale?: string): string {
-	// Check if input is in YYYY-MM-DD format
+export function formatDateCompact(dateStr: string, timezone?: string): string {
 	const isSimpleDateFormat = /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
-	// For YYYY-MM-DD format, append T00:00:00 to parse as local date
-	// Without this, new Date('YYYY-MM-DD') interprets as UTC midnight
+	if (isSimpleDateFormat && (timezone == null || timezone === 'UTC')) {
+		return `${dateStr.slice(0, 4)}\n${dateStr.slice(5)}`;
+	}
+
 	const date = isSimpleDateFormat
 		? timezone != null
 			? new Date(`${dateStr}T00:00:00Z`)
 			: new Date(`${dateStr}T00:00:00`)
 		: new Date(dateStr);
-	const formatter = createDatePartsFormatter(timezone, locale ?? DEFAULT_LOCALE);
+	if (timezone == null) {
+		return formatDateParts(date.getFullYear(), date.getMonth() + 1, date.getDate());
+	}
+	if (timezone === 'UTC') {
+		return formatDateParts(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
+	}
+
+	const formatter = createDatePartsFormatter(timezone);
 	const parts = formatter.formatToParts(date);
 	const year = parts.find((p) => p.type === 'year')?.value ?? '';
 	const month = parts.find((p) => p.type === 'month')?.value ?? '';
@@ -88,7 +248,6 @@ export class ResponsiveTable {
 	private head: string[];
 	private rows: TableRow[] = [];
 	private colAligns: TableCellAlign[];
-	private style?: { head?: string[] };
 	private dateFormatter?: (dateStr: string) => string;
 	private compactHead?: string[];
 	private compactColAligns?: TableCellAlign[];
@@ -104,7 +263,6 @@ export class ResponsiveTable {
 	constructor(options: TableOptions) {
 		this.head = options.head;
 		this.colAligns = options.colAligns ?? Array.from({ length: this.head.length }, () => 'left');
-		this.style = options.style;
 		this.dateFormatter = options.dateFormatter;
 		this.compactHead = options.compactHead;
 		this.compactColAligns = options.compactColAligns;
@@ -199,22 +357,15 @@ export class ResponsiveTable {
 			? dataRows.map((row) => this.filterRowToCompact(row, compactIndices))
 			: dataRows;
 
-		const allRows = [
-			head.map(String),
-			...processedDataRows.map((row) =>
-				row.map((cell) => {
-					if (typeof cell === 'object' && cell != null && 'content' in cell) {
-						return String(cell.content);
-					}
-					return String(cell ?? '');
-				}),
-			),
-		];
-
-		const contentWidths = head.map((_, colIndex) => {
-			const maxLength = Math.max(...allRows.map((row) => stringWidth(String(row[colIndex] ?? ''))));
-			return maxLength;
-		});
+		const contentWidths = head.map((header) => getStringWidth(header));
+		for (const row of processedDataRows) {
+			for (let colIndex = 0; colIndex < head.length; colIndex++) {
+				const width = getStringWidth(stringifyCell(row[colIndex]));
+				if (width > contentWidths[colIndex]!) {
+					contentWidths[colIndex] = width;
+				}
+			}
+		}
 
 		// Calculate table overhead
 		const numColumns = head.length;
@@ -238,7 +389,6 @@ export class ResponsiveTable {
 		const totalRequiredWidth = columnWidths.reduce((sum, width) => sum + width, 0) + tableOverhead;
 
 		if (totalRequiredWidth > terminalWidth) {
-			// Apply responsive resizing and use compact date format if available
 			const scaleFactor = availableWidth / columnWidths.reduce((sum, width) => sum + width, 0);
 			const adjustedWidths = columnWidths.map((width, index) => {
 				const align = colAligns[index];
@@ -258,23 +408,34 @@ export class ResponsiveTable {
 				return adjustedWidth;
 			});
 
-			const table = new Table({
+			return this.renderFastTable(
 				head,
-				style: this.style,
 				colAligns,
-				colWidths: adjustedWidths,
-				wordWrap: true,
-				wrapOnWordBoundary: true,
-			});
+				adjustedWidths,
+				this.getRenderableRows(dataRows, compactIndices, true),
+			);
+		} else {
+			return this.renderFastTable(
+				head,
+				colAligns,
+				columnWidths,
+				this.getRenderableRows(dataRows, compactIndices, false),
+			);
+		}
+	}
 
-			// Add rows with special handling for separators and date formatting
-			for (const row of this.rows) {
-				if (this.isSeparatorRow(row)) {
-					// Skip separator rows - cli-table3 will handle borders automatically
-					continue;
-				} else {
-					// Use compact date format for first column if dateFormatter available
-					let processedRow = row.map((cell, index) => {
+	private getRenderableRows(
+		rows: TableRow[],
+		compactIndices: number[],
+		applyDateFormatter: boolean,
+	): TableRow[] {
+		if (!this.compactMode && !applyDateFormatter) {
+			return rows;
+		}
+
+		return rows.map((row) => {
+			const processedRow = applyDateFormatter
+				? row.map((cell, index) => {
 						if (
 							index === 0 &&
 							this.dateFormatter != null &&
@@ -284,45 +445,13 @@ export class ResponsiveTable {
 							return this.dateFormatter(cell);
 						}
 						return cell;
-					});
+					})
+				: row;
 
-					// Filter to compact columns if in compact mode
-					if (this.compactMode) {
-						processedRow = this.filterRowToCompact(processedRow, compactIndices);
-					}
-
-					table.push(processedRow);
-				}
-			}
-
-			return table.toString();
-		} else {
-			// Use generous column widths with normal date format
-			const table = new Table({
-				head,
-				style: this.style,
-				colAligns,
-				colWidths: columnWidths,
-				wordWrap: true,
-				wrapOnWordBoundary: true,
-			});
-
-			// Add rows with special handling for separators
-			for (const row of this.rows) {
-				if (this.isSeparatorRow(row)) {
-					// Skip separator rows - cli-table3 will handle borders automatically
-					continue;
-				} else {
-					// Filter to compact columns if in compact mode
-					const processedRow = this.compactMode
-						? this.filterRowToCompact(row, compactIndices)
-						: row;
-					table.push(processedRow);
-				}
-			}
-
-			return table.toString();
-		}
+			return this.compactMode
+				? this.filterRowToCompact(processedRow, compactIndices)
+				: processedRow;
+		});
 	}
 
 	/**
@@ -349,6 +478,72 @@ export class ResponsiveTable {
 		// Check if string matches date format YYYY-MM-DD
 		return /^\d{4}-\d{2}-\d{2}$/.test(text);
 	}
+
+	private renderFastTable(
+		head: string[],
+		colAligns: TableCellAlign[],
+		colWidths: number[],
+		rows: TableRow[] = this.rows.filter((row) => !this.isSeparatorRow(row)),
+	): string {
+		const innerWidths = colWidths.map((width) => Math.max(1, width - 2));
+		const border = {
+			top: this.renderBorder('┌', '┬', '┐', innerWidths),
+			mid: this.renderBorder('├', '┼', '┤', innerWidths),
+			bottom: this.renderBorder('└', '┴', '┘', innerWidths),
+		};
+		const output: string[] = [border.top];
+		output.push(...this.renderFastRow(head, innerWidths, colAligns, true, false));
+		output.push(border.mid);
+		for (let index = 0; index < rows.length; index++) {
+			output.push(
+				...this.renderFastRow(rows[index]!, innerWidths, colAligns, false, this.compactMode),
+			);
+			output.push(index === rows.length - 1 ? border.bottom : border.mid);
+		}
+		return output.join('\n');
+	}
+
+	private renderBorder(left: string, middle: string, right: string, innerWidths: number[]): string {
+		const segments = innerWidths.map((width) => '─'.repeat(width + 2));
+		return pc.gray(`${left}${segments.join(middle)}${right}`);
+	}
+
+	private renderFastRow(
+		row: TableRow,
+		innerWidths: number[],
+		colAligns: TableCellAlign[],
+		isHeader: boolean,
+		wrapCells: boolean,
+	): string[] {
+		const cellLines = innerWidths.map((width, index) => {
+			const cell = row[index] ?? '';
+			const content = stringifyCell(cell);
+			const lines = isHeader
+				? splitCellContent(content).flatMap((line) => wrapHeaderLine(line, width))
+				: splitCellContent(content).flatMap((line) =>
+						wrapCells ? wrapCellLine(line, width) : [line],
+					);
+			return lines.length === 0 ? [''] : lines;
+		});
+		const rowHeight = Math.max(...cellLines.map((lines) => lines.length));
+		const lines: string[] = [];
+		for (let lineIndex = 0; lineIndex < rowHeight; lineIndex++) {
+			let line = pc.gray('│');
+			for (let colIndex = 0; colIndex < innerWidths.length; colIndex++) {
+				const cell = row[colIndex] ?? '';
+				const align =
+					typeof cell === 'object' && cell != null && 'content' in cell && cell.hAlign != null
+						? cell.hAlign
+						: (colAligns[colIndex] ?? 'left');
+				const content = cellLines[colIndex]?.[lineIndex] ?? '';
+				const padded = padToWidth(content, innerWidths[colIndex]!, align);
+				line += isHeader ? pc.cyan(` ${padded} `) : ` ${padded} `;
+				line += pc.gray('│');
+			}
+			lines.push(line);
+		}
+		return lines;
+	}
 }
 
 /**
@@ -357,7 +552,13 @@ export class ResponsiveTable {
  * @returns Formatted number string with commas as thousand separators
  */
 export function formatNumber(num: number): string {
-	return num.toLocaleString('en-US');
+	const cached = formattedNumberCache.get(num);
+	if (cached != null) {
+		return cached;
+	}
+	const formatted = getNumberFormatter().format(num);
+	formattedNumberCache.set(num, formatted);
+	return formatted;
 }
 
 /**
@@ -376,16 +577,26 @@ export function formatCurrency(amount: number): string {
  * @returns Shortened model name (e.g., "sonnet-4" or "sonnet-4-5") or original if pattern doesn't match
  */
 function formatModelName(modelName: string): string {
+	const cached = formattedModelNameCache.get(modelName);
+	if (cached != null) {
+		return cached;
+	}
+
+	let formatted = modelName;
 	// Handle [pi] prefix - preserve prefix, format the rest
 	const piMatch = modelName.match(/^\[pi\] (.+)$/);
 	if (piMatch?.[1] != null) {
-		return `[pi] ${formatModelName(piMatch[1])}`;
+		formatted = `[pi] ${formatModelName(piMatch[1])}`;
+		formattedModelNameCache.set(modelName, formatted);
+		return formatted;
 	}
 
 	// Handle anthropic/ prefix with dot notation (e.g., "anthropic/claude-opus-4.5" -> "opus-4.5")
 	const anthropicMatch = modelName.match(/^anthropic\/claude-(\w+)-([\d.]+)$/);
 	if (anthropicMatch != null) {
-		return `${anthropicMatch[1]}-${anthropicMatch[2]}`;
+		formatted = `${anthropicMatch[1]}-${anthropicMatch[2]}`;
+		formattedModelNameCache.set(modelName, formatted);
+		return formatted;
 	}
 
 	// Extract model type from full model name with date suffix (must check before no-date pattern)
@@ -394,17 +605,19 @@ function formatModelName(modelName: string): string {
 	// e.g., "claude-sonnet-4-5-20250929" -> "sonnet-4-5"
 	const match = modelName.match(/^claude-(\w+)-([\d-]+)-(\d{8})$/);
 	if (match != null) {
-		return `${match[1]}-${match[2]}`;
+		formatted = `${match[1]}-${match[2]}`;
+		formattedModelNameCache.set(modelName, formatted);
+		return formatted;
 	}
 
 	// Handle claude- without date suffix (e.g., "claude-opus-4-5" -> "opus-4-5")
 	const noDateMatch = modelName.match(/^claude-(\w+)-([\d-]+)$/);
 	if (noDateMatch != null) {
-		return `${noDateMatch[1]}-${noDateMatch[2]}`;
+		formatted = `${noDateMatch[1]}-${noDateMatch[2]}`;
 	}
 
-	// Return original if pattern doesn't match
-	return modelName;
+	formattedModelNameCache.set(modelName, formatted);
+	return formatted;
 }
 
 /**
@@ -415,7 +628,7 @@ function formatModelName(modelName: string): string {
  */
 export function formatModelsDisplay(models: string[]): string {
 	// Format array of models for display
-	const uniqueModels = uniq(models.map(formatModelName));
+	const uniqueModels = Array.from(new Set(models.map(formatModelName)));
 	return uniqueModels.sort().join(', ');
 }
 
@@ -427,7 +640,7 @@ export function formatModelsDisplay(models: string[]): string {
  */
 export function formatModelsDisplayMultiline(models: string[]): string {
 	// Format array of models for display with newlines and bullet points
-	const uniqueModels = uniq(models.map(formatModelName));
+	const uniqueModels = Array.from(new Set(models.map(formatModelName)));
 	return uniqueModels
 		.sort()
 		.map((model) => `- ${model}`)
@@ -1081,23 +1294,28 @@ if (import.meta.vitest != null) {
 
 	describe('formatDateCompact', () => {
 		it('should format date to compact format with newline', () => {
-			const result = formatDateCompact('2024-08-04', undefined, 'en-US');
+			const result = formatDateCompact('2024-08-04');
 			expect(result).toBe('2024\n08-04');
 		});
 
 		it('should handle timezone parameter', () => {
-			const result = formatDateCompact('2024-08-04T12:00:00Z', 'UTC', 'en-US');
+			const result = formatDateCompact('2024-08-04T12:00:00Z', 'UTC');
 			expect(result).toBe('2024\n08-04');
 		});
 
 		it('should handle YYYY-MM-DD format dates', () => {
-			const result = formatDateCompact('2024-08-04', undefined, 'en-US');
+			const result = formatDateCompact('2024-08-04');
 			expect(result).toBe('2024\n08-04');
 		});
 
 		it('should handle timezone with YYYY-MM-DD format', () => {
-			const result = formatDateCompact('2024-08-04', 'UTC', 'en-US');
+			const result = formatDateCompact('2024-08-04', 'UTC');
 			expect(result).toBe('2024\n08-04');
+		});
+
+		it('should handle non-UTC timezone with YYYY-MM-DD format', () => {
+			const result = formatDateCompact('2024-08-04', 'America/New_York');
+			expect(result).toBe('2024\n08-03');
 		});
 
 		it('should use default locale when not specified', () => {

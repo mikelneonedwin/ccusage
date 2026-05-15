@@ -13,6 +13,30 @@ export const LITELLM_PRICING_URL =
  */
 const DEFAULT_TIERED_THRESHOLD = 200_000;
 
+function calculateTieredCost(
+	totalTokens: number | undefined,
+	basePrice: number | undefined,
+	tieredPrice: number | undefined,
+): number {
+	if (totalTokens == null || totalTokens <= 0) {
+		return 0;
+	}
+
+	if (totalTokens > DEFAULT_TIERED_THRESHOLD && tieredPrice != null) {
+		let tieredCost = (totalTokens - DEFAULT_TIERED_THRESHOLD) * tieredPrice;
+		if (basePrice != null) {
+			tieredCost += DEFAULT_TIERED_THRESHOLD * basePrice;
+		}
+		return tieredCost;
+	}
+
+	if (basePrice != null) {
+		return totalTokens * basePrice;
+	}
+
+	return 0;
+}
+
 /**
  * LiteLLM Model Pricing Schema
  *
@@ -94,6 +118,7 @@ function createLogger(logger?: PricingLogger): PricingLogger {
 
 export class LiteLLMPricingFetcher implements Disposable {
 	private cachedPricing: Map<string, LiteLLMModelPricing> | null = null;
+	private readonly modelPricingCache = new Map<string, LiteLLMModelPricing | null>();
 	private readonly logger: PricingLogger;
 	private readonly offline: boolean;
 	private readonly offlineLoader?: () => Promise<Record<string, LiteLLMModelPricing>>;
@@ -114,6 +139,7 @@ export class LiteLLMPricingFetcher implements Disposable {
 
 	clearCache(): void {
 		this.cachedPricing = null;
+		this.modelPricingCache.clear();
 	}
 
 	private loadOfflinePricing = Result.try({
@@ -219,12 +245,17 @@ export class LiteLLMPricingFetcher implements Disposable {
 	}
 
 	async getModelPricing(modelName: string): Result.ResultAsync<LiteLLMModelPricing | null, Error> {
+		if (this.modelPricingCache.has(modelName)) {
+			return Result.succeed(this.modelPricingCache.get(modelName) ?? null);
+		}
+
 		return Result.pipe(
 			this.ensurePricingLoaded(),
 			Result.map((pricing) => {
 				for (const candidate of this.createMatchingCandidates(modelName)) {
 					const direct = pricing.get(candidate);
 					if (direct != null) {
+						this.modelPricingCache.set(modelName, direct);
 						return direct;
 					}
 				}
@@ -233,10 +264,12 @@ export class LiteLLMPricingFetcher implements Disposable {
 				for (const [key, value] of pricing) {
 					const comparison = key.toLowerCase();
 					if (comparison.includes(lower) || lower.includes(comparison)) {
+						this.modelPricingCache.set(modelName, value);
 						return value;
 					}
 				}
 
+				this.modelPricingCache.set(modelName, null);
 				return null;
 			}),
 		);
@@ -273,48 +306,6 @@ export class LiteLLMPricingFetcher implements Disposable {
 		},
 		pricing: LiteLLMModelPricing,
 	): number {
-		/**
-		 * Calculate cost with tiered pricing for 1M context window models
-		 *
-		 * @param totalTokens - Total number of tokens to calculate cost for
-		 * @param basePrice - Price per token for tokens up to the threshold
-		 * @param tieredPrice - Price per token for tokens above the threshold
-		 * @param threshold - Token threshold for tiered pricing (default 200k)
-		 * @returns Total cost applying tiered pricing when applicable
-		 *
-		 * @example
-		 * // 300k tokens with base price $3/M and tiered price $6/M
-		 * calculateTieredCost(300_000, 3e-6, 6e-6)
-		 * // Returns: (200_000 * 3e-6) + (100_000 * 6e-6) = $1.2
-		 */
-		const calculateTieredCost = (
-			totalTokens: number | undefined,
-			basePrice: number | undefined,
-			tieredPrice: number | undefined,
-			threshold: number = DEFAULT_TIERED_THRESHOLD,
-		): number => {
-			if (totalTokens == null || totalTokens <= 0) {
-				return 0;
-			}
-
-			if (totalTokens > threshold && tieredPrice != null) {
-				const tokensBelowThreshold = Math.min(totalTokens, threshold);
-				const tokensAboveThreshold = Math.max(0, totalTokens - threshold);
-
-				let tieredCost = tokensAboveThreshold * tieredPrice;
-				if (basePrice != null) {
-					tieredCost += tokensBelowThreshold * basePrice;
-				}
-				return tieredCost;
-			}
-
-			if (basePrice != null) {
-				return totalTokens * basePrice;
-			}
-
-			return 0;
-		};
-
 		const inputCost = calculateTieredCost(
 			tokens.input_tokens,
 			pricing.input_cost_per_token,

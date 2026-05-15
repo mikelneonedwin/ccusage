@@ -7,17 +7,15 @@ import {
 	formatUsageDataRow,
 	pushBreakdownRows,
 } from '@ccusage/terminal/table';
-import { Result } from '@praha/byethrow';
 import { define } from 'gunshi';
 import { loadConfig, mergeConfigWithArgs } from '../_config-loader-tokens.ts';
 import { WEEK_DAYS } from '../_consts.ts';
 import { formatDateCompact } from '../_date-utils.ts';
-import { processWithJq } from '../_jq-processor.ts';
 import { sharedArgs } from '../_shared-args.ts';
 import { calculateTotals, createTotalsObject, getTotalTokens } from '../calculate-cost.ts';
 import { loadWeeklyUsageData } from '../data-loader.ts';
 import { detectMismatches, printMismatchReport } from '../debug.ts';
-import { log, logger } from '../logger.ts';
+import { logger, writeStdoutLine } from '../logger.ts';
 
 export const weeklyCommand = define({
 	name: 'weekly',
@@ -38,8 +36,7 @@ export const weeklyCommand = define({
 		const config = loadConfig(ctx.values.config, ctx.values.debug);
 		const mergedOptions = mergeConfigWithArgs(ctx, config, ctx.values.debug);
 
-		// --jq implies --json
-		const useJson = Boolean(mergedOptions.json) || mergedOptions.jq != null;
+		const useJson = Boolean(mergedOptions.json);
 		if (useJson) {
 			logger.level = 0;
 		}
@@ -59,7 +56,7 @@ export const weeklyCommand = define({
 						totalCost: 0,
 					},
 				};
-				log(JSON.stringify(emptyOutput, null, 2));
+				await writeStdoutLine(JSON.stringify(emptyOutput, null, 2));
 			} else {
 				logger.warn('No Claude usage data found.');
 			}
@@ -92,17 +89,7 @@ export const weeklyCommand = define({
 				totals: createTotalsObject(totals),
 			};
 
-			// Process with jq if specified
-			if (mergedOptions.jq != null) {
-				const jqResult = await processWithJq(jsonOutput, mergedOptions.jq);
-				if (Result.isFailure(jqResult)) {
-					logger.error(jqResult.error.message);
-					process.exit(1);
-				}
-				log(jqResult.value);
-			} else {
-				log(JSON.stringify(jsonOutput, null, 2));
-			}
+			await writeStdoutLine(JSON.stringify(jsonOutput, null, 2));
 		} else {
 			// Print header
 			logger.box('Claude Code Token Usage Report - Weekly');
@@ -147,7 +134,7 @@ export const weeklyCommand = define({
 			});
 			table.push(totalsRow);
 
-			log(table.toString());
+			await writeStdoutLine(table.toString());
 
 			// Show guidance message if in compact mode
 			if (table.isCompactMode()) {

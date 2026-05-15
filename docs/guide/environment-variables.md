@@ -72,7 +72,7 @@ ccusage daily --json > usage-report.json
 
 ## LOG_LEVEL
 
-Controls the verbosity of log output. ccusage uses [consola](https://github.com/unjs/consola) for logging under the hood.
+Controls the verbosity of log output.
 
 ### Log Levels
 
@@ -140,6 +140,14 @@ Force offline mode by default:
 ```bash
 export CCUSAGE_OFFLINE=1
 ccusage daily  # Runs in offline mode
+```
+
+### CCUSAGE_BUN_AUTO_RUN
+
+When the published CLI starts under Node.js and finds `bun` in `PATH`, it automatically re-runs the bundled entrypoint with Bun. Disable this if you need to force Node.js:
+
+```bash
+CCUSAGE_BUN_AUTO_RUN=0 ccusage daily
 ```
 
 ### NO_COLOR

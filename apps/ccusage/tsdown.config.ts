@@ -2,26 +2,43 @@ import { defineConfig } from 'tsdown';
 import Macros from 'unplugin-macros/rolldown';
 
 export default defineConfig({
-	entry: [
-		'./src/*.ts',
-		'!./src/**/*.test.ts', // Exclude test files
-		'!./src/_*.ts', // Exclude internal files with underscore prefix
-	],
+	entry: {
+		cli: './src/cli.ts',
+		index: './src/index.ts',
+		'main.node': './src/main.node.ts',
+		'main.bun': './src/main.bun.ts',
+		'data-loader': './src/data-loader.ts',
+	},
 	outDir: 'dist',
 	format: 'esm',
 	clean: true,
-	sourcemap: false,
-	minify: 'dce-only',
-	treeshake: true,
-	fixedExtension: false,
-	dts: {
-		tsgo: false,
-		resolve: ['type-fest', 'valibot', '@ccusage/internal', '@ccusage/terminal'],
+	sourcemap: true,
+	minify: true,
+	treeshake: {
+		moduleSideEffects: false,
 	},
+	fixedExtension: false,
+	dts: false,
 	publint: true,
 	unused: true,
-	exports: {
-		devExports: true,
+	deps: {
+		onlyBundle: false,
+	},
+	inputOptions: {
+		optimization: {
+			inlineConst: {
+				mode: 'all',
+				pass: 2,
+			},
+		},
+		preserveEntrySignatures: false,
+	},
+	outputOptions: {
+		comments: {
+			legal: true,
+			annotation: true,
+			jsdoc: false,
+		},
 	},
 	nodeProtocol: true,
 	plugins: [

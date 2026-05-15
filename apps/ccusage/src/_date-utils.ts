@@ -5,26 +5,42 @@
 
 import type { DayOfWeek, WeekDay } from './_consts.ts';
 import type { WeeklyDate } from './_types.ts';
-import { sort } from 'fast-sort';
 import { DEFAULT_LOCALE } from './_consts.ts';
 import { createWeeklyDate } from './_types.ts';
-import { unreachable } from './_utils.ts';
 
+export { sortByDate } from '@ccusage/internal/sort';
 // Re-export formatDateCompact from shared package
 export { formatDateCompact } from '@ccusage/terminal/table';
 
-/**
- * Sort order for date-based sorting
- */
-export type SortOrder = 'asc' | 'desc';
+const dateFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
+function formatDateParts(year: number, month: number, day: number): string {
+	return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`;
+}
+
+function formatLocalDate(date: Date): string {
+	return formatDateParts(date.getFullYear(), date.getMonth() + 1, date.getDate());
+}
+
+function formatUTCDate(date: Date): string {
+	return formatDateParts(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate());
+}
 
 function createDateFormatter(timezone: string | undefined): Intl.DateTimeFormat {
-	return new Intl.DateTimeFormat(DEFAULT_LOCALE, {
+	const cacheKey = timezone ?? '';
+	const cached = dateFormatterCache.get(cacheKey);
+	if (cached != null) {
+		return cached;
+	}
+
+	const formatter = new Intl.DateTimeFormat(DEFAULT_LOCALE, {
 		year: 'numeric',
 		month: '2-digit',
 		day: '2-digit',
 		timeZone: timezone,
 	});
+	dateFormatterCache.set(cacheKey, formatter);
+	return formatter;
 }
 
 /**
@@ -35,31 +51,57 @@ function createDateFormatter(timezone: string | undefined): Intl.DateTimeFormat 
  */
 export function formatDate(dateStr: string, timezone?: string): string {
 	const date = new Date(dateStr);
+	if (timezone == null) {
+		return formatLocalDate(date);
+	}
+	if (timezone === 'UTC') {
+		return formatUTCDate(date);
+	}
 	const formatter = createDateFormatter(timezone);
 	return formatter.format(date);
 }
 
-/**
- * Generic function to sort items by date based on sort order
- * @param items - Array of items to sort
- * @param getDate - Function to extract date/timestamp from item
- * @param order - Sort order (asc or desc)
- * @returns Sorted array
- */
-export function sortByDate<T>(
-	items: T[],
-	getDate: (item: T) => string | Date,
-	order: SortOrder = 'desc',
-): T[] {
-	const sorted = sort(items);
-	switch (order) {
-		case 'desc':
-			return sorted.desc((item) => new Date(getDate(item)).getTime());
-		case 'asc':
-			return sorted.asc((item) => new Date(getDate(item)).getTime());
-		default:
-			unreachable(order);
+export function createCachedDateFormatter(timezone?: string): (dateStr: string) => string {
+	if (timezone == null) {
+		const cache = new Map<string, string>();
+		return (dateStr: string): string => {
+			const cacheKey = dateStr.slice(0, 13);
+			const cached = cache.get(cacheKey);
+			if (cached != null) {
+				return cached;
+			}
+			const formatted = formatLocalDate(new Date(dateStr));
+			cache.set(cacheKey, formatted);
+			return formatted;
+		};
 	}
+
+	if (timezone === 'UTC') {
+		const cache = new Map<string, string>();
+		return (dateStr: string): string => {
+			const cacheKey = dateStr.slice(0, 13);
+			const cached = cache.get(cacheKey);
+			if (cached != null) {
+				return cached;
+			}
+			const formatted = formatUTCDate(new Date(dateStr));
+			cache.set(cacheKey, formatted);
+			return formatted;
+		};
+	}
+
+	const formatter = createDateFormatter(timezone);
+	const cache = new Map<string, string>();
+	return (dateStr: string): string => {
+		const cacheKey = dateStr.slice(0, 13);
+		const cached = cache.get(cacheKey);
+		if (cached != null) {
+			return cached;
+		}
+		const formatted = formatter.format(new Date(dateStr));
+		cache.set(cacheKey, formatted);
+		return formatted;
+	};
 }
 
 /**
@@ -108,6 +150,21 @@ export function getDateWeek(date: Date, startDay: DayOfWeek): WeeklyDate {
 }
 
 /**
+ * Get the first day of the week for an existing YYYY-MM-DD daily bucket key.
+ *
+ * This preserves `getDateWeek(new Date(date), startDay)` semantics while avoiding the extra Date
+ * clone inside `getDateWeek` when weekly aggregation is already working from daily strings.
+ */
+export function getDateStringWeek(date: string, startDay: DayOfWeek): WeeklyDate {
+	const d = new Date(date);
+	const day = d.getDay();
+	const shift = (day - startDay + 7) % 7;
+	d.setDate(d.getDate() - shift);
+
+	return createWeeklyDate(d.toISOString().substring(0, 10));
+}
+
+/**
  * Convert day name to number (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
  * @param day - Day name
  * @returns Day number
@@ -140,41 +197,6 @@ if (import.meta.vitest != null) {
 		it('uses the default YYYY-MM-DD locale', () => {
 			const result = formatDate('2024-08-04T12:00:00Z');
 			expect(result).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-		});
-	});
-
-	// formatDateCompact tests are in @ccusage/terminal/table.ts
-
-	describe('sortByDate', () => {
-		const testData = [
-			{ id: 1, date: '2024-01-01T10:00:00Z' },
-			{ id: 2, date: '2024-01-03T10:00:00Z' },
-			{ id: 3, date: '2024-01-02T10:00:00Z' },
-		];
-
-		it('should sort by date in descending order by default', () => {
-			const result = sortByDate(testData, (item) => item.date);
-			expect(result.map((item) => item.id)).toEqual([2, 3, 1]);
-		});
-
-		it('should sort by date in ascending order when specified', () => {
-			const result = sortByDate(testData, (item) => item.date, 'asc');
-			expect(result.map((item) => item.id)).toEqual([1, 3, 2]);
-		});
-
-		it('should sort by date in descending order when explicitly specified', () => {
-			const result = sortByDate(testData, (item) => item.date, 'desc');
-			expect(result.map((item) => item.id)).toEqual([2, 3, 1]);
-		});
-
-		it('should handle Date objects', () => {
-			const dateData = [
-				{ id: 1, date: new Date('2024-01-01T10:00:00Z') },
-				{ id: 2, date: new Date('2024-01-03T10:00:00Z') },
-				{ id: 3, date: new Date('2024-01-02T10:00:00Z') },
-			];
-			const result = sortByDate(dateData, (item) => item.date);
-			expect(result.map((item) => item.id)).toEqual([2, 3, 1]);
 		});
 	});
 
@@ -241,6 +263,17 @@ if (import.meta.vitest != null) {
 			const date = new Date('2023-12-31T10:00:00Z'); // Sunday
 			const result = getDateWeek(date, 0); // Sunday start
 			expect(result).toBe(createWeeklyDate('2023-12-31')); // Same Sunday
+		});
+	});
+
+	describe('getDateStringWeek', () => {
+		it('matches getDateWeek for daily usage date strings', () => {
+			const dates = ['2023-12-31', '2024-01-01', '2024-01-03', '2024-01-07'];
+
+			for (const date of dates) {
+				expect(getDateStringWeek(date, 0)).toBe(getDateWeek(new Date(date), 0));
+				expect(getDateStringWeek(date, 1)).toBe(getDateWeek(new Date(date), 1));
+			}
 		});
 	});
 

@@ -73,6 +73,11 @@ export const sharedArgs = {
 		description: 'Use cached pricing data for Claude models instead of fetching from API',
 		default: false,
 	},
+	singleThread: {
+		type: 'boolean',
+		description: 'Disable parallel JSONL file loading',
+		default: false,
+	},
 	color: {
 		// --color and FORCE_COLOR=1 is handled by picocolors
 		type: 'boolean',
@@ -88,11 +93,6 @@ export const sharedArgs = {
 		short: 'z',
 		description:
 			'Timezone for date grouping (e.g., UTC, America/New_York, Asia/Tokyo). Default: system timezone',
-	},
-	jq: {
-		type: 'string',
-		short: 'q',
-		description: 'Process JSON output with jq command (requires jq binary, implies --json)',
 	},
 	config: {
 		type: 'string',

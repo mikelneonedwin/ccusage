@@ -17,39 +17,31 @@
 	},
 	"exports": {
 		".": "./src/index.ts",
-		"./calculate-cost": "./src/calculate-cost.ts",
-		"./data-loader": "./src/data-loader.ts",
-		"./debug": "./src/debug.ts",
-		"./logger": "./src/logger.ts",
 		"./package.json": "./package.json"
 	},
 	"main": "./dist/index.js",
 	"module": "./dist/index.js",
-	"types": "./dist/index.d.ts",
 	"bin": {
-		"ccusage": "./src/index.ts"
+		"ccusage": "./src/cli.ts"
 	},
 	"files": [
 		"config-schema.json",
-		"dist"
+		"dist/**/*.js"
 	],
 	"publishConfig": {
 		"bin": {
-			"ccusage": "./dist/index.js"
+			"ccusage": "./dist/cli.js"
 		},
 		"exports": {
 			".": "./dist/index.js",
-			"./calculate-cost": "./dist/calculate-cost.js",
-			"./data-loader": "./dist/data-loader.js",
-			"./debug": "./dist/debug.js",
-			"./logger": "./dist/logger.js",
 			"./package.json": "./package.json"
 		}
 	},
 	"engines": {
-		"node": ">=22.11.0"
+		"node": ">=22.0.0"
 	},
 	"scripts": {
+		"bench": "node scripts/bench.mjs",
 		"build": "pnpm run generate:schema && tsdown",
 		"format": "pnpm run lint --fix",
 		"generate:schema": "bun scripts/generate-json-schema.ts",
@@ -73,7 +65,6 @@
 		"@oxc-project/runtime": "catalog:build",
 		"@praha/byethrow": "catalog:runtime",
 		"@ryoppippi/eslint-config": "catalog:lint",
-		"@ryoppippi/limo": "catalog:runtime",
 		"@std/async": "catalog:runtime",
 		"@types/bun": "catalog:types",
 		"@typescript/native-preview": "catalog:types",
@@ -82,18 +73,15 @@
 		"clean-pkg-json": "catalog:release",
 		"eslint": "catalog:lint",
 		"eslint-plugin-format": "catalog:lint",
-		"fast-sort": "catalog:runtime",
 		"fs-fixture": "catalog:testing",
 		"get-stdin": "catalog:runtime",
 		"gunshi": "catalog:runtime",
-		"nano-spawn": "catalog:runtime",
+		"mitata": "catalog:testing",
 		"p-limit": "catalog:runtime",
 		"path-type": "catalog:runtime",
 		"picocolors": "catalog:runtime",
 		"pretty-ms": "catalog:runtime",
 		"publint": "catalog:lint",
-		"string-width": "catalog:runtime",
-		"tinyglobby": "catalog:runtime",
 		"tsdown": "catalog:build",
 		"type-fest": "catalog:runtime",
 		"unplugin-macros": "catalog:build",

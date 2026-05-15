@@ -8,65 +8,242 @@
  * @module data-loader
  */
 
+import type { LiteLLMModelPricing } from '@ccusage/internal/pricing';
 import type { WeekDay } from './_consts.ts';
 import type { LoadedUsageEntry, SessionBlock } from './_session-blocks.ts';
-import type { ActivityDate, Bucket, CostMode, ModelName, SortOrder, Version } from './_types.ts';
+import type {
+	ActivityDate,
+	Bucket,
+	CostMode,
+	DailyDate,
+	ISOTimestamp,
+	MessageId,
+	ModelName,
+	MonthlyDate,
+	ProjectPath,
+	RequestId,
+	SessionId,
+	SortOrder,
+	Version,
+	WeeklyDate,
+} from './_types.ts';
 import { Buffer } from 'node:buffer';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { open, readdir, readFile, stat, utimes } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createInterface } from 'node:readline';
+import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 import { toArray } from '@antfu/utils';
+import { createResultSlots } from '@ccusage/internal/array';
+import { compareStrings } from '@ccusage/internal/sort';
 import { Result } from '@praha/byethrow';
-import { sort } from 'fast-sort';
 import { createFixture } from 'fs-fixture';
 import { isDirectorySync } from 'path-type';
-import { glob } from 'tinyglobby';
 import * as v from 'valibot';
 import {
 	CLAUDE_CONFIG_DIR_ENV,
 	CLAUDE_PROJECTS_DIR_NAME,
 	DEFAULT_CLAUDE_CODE_PATH,
 	DEFAULT_CLAUDE_CONFIG_PATH,
-	USAGE_DATA_GLOB_PATTERN,
 	USER_HOME_DIR,
 } from './_consts.ts';
 import {
+	createCachedDateFormatter,
 	filterByDateRange,
 	formatDate,
-	formatDateCompact,
-	getDateWeek,
+	getDateStringWeek,
 	getDayNumber,
 	sortByDate,
 } from './_date-utils.ts';
-import { PricingFetcher } from './_pricing-fetcher.ts';
+import { CLAUDE_PROVIDER_PREFIXES, PricingFetcher } from './_pricing-fetcher.ts';
 import { identifySessionBlocks } from './_session-blocks.ts';
 import {
-	activityDateSchema,
 	createBucket,
-	createDailyDate,
 	createISOTimestamp,
 	createMessageId,
 	createModelName,
-	createMonthlyDate,
-	createProjectPath,
 	createRequestId,
 	createSessionId,
 	createVersion,
-	dailyDateSchema,
 	isoTimestampSchema,
 	messageIdSchema,
 	modelNameSchema,
-	monthlyDateSchema,
-	projectPathSchema,
 	requestIdSchema,
 	sessionIdSchema,
 	versionSchema,
-	weeklyDateSchema,
 } from './_types.ts';
 import { unreachable } from './_utils.ts';
 import { logger } from './logger.ts';
+
+const USAGE_LINE_MARKER = '"usage":{';
+const USAGE_LINE_MARKER_BUFFER = Buffer.from(USAGE_LINE_MARKER);
+const CACHE_CREATION_INPUT_TOKENS_MARKER = '"cache_creation_input_tokens":';
+const CACHE_READ_INPUT_TOKENS_MARKER = '"cache_read_input_tokens":';
+const CONTENT_MARKER = '"content":';
+const COST_USD_MARKER = '"costUSD":';
+const INPUT_TOKENS_MARKER = '"input_tokens":';
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+const MAX_BUFFERED_JSONL_BYTES = 128 * 1024 * 1024;
+const JSONL_WORKER_THREAD_LIMIT = 9;
+const MESSAGE_ID_MARKER = '"id":"';
+const MODEL_MARKER = '"model":"';
+const OUTPUT_TOKENS_MARKER = '"output_tokens":';
+const REQUEST_ID_MARKER = '"requestId":"';
+const SPEED_MARKER = '"speed":"';
+const TIMESTAMP_MARKER = '"timestamp":"';
+const VERSION_MARKER = '"version":"';
+const VERSION_PATTERN = /^\d+\.\d+\.\d+/;
+function parseTwoDigits(value: string, offset: number): number {
+	return (value.charCodeAt(offset) - 48) * 10 + value.charCodeAt(offset + 1) - 48;
+}
+
+function parseFourDigits(value: string, offset: number): number {
+	return (
+		(value.charCodeAt(offset) - 48) * 1000 +
+		(value.charCodeAt(offset + 1) - 48) * 100 +
+		(value.charCodeAt(offset + 2) - 48) * 10 +
+		(value.charCodeAt(offset + 3) - 48)
+	);
+}
+
+function hasAsciiDigits(value: string, start: number, end: number): boolean {
+	for (let index = start; index < end; index++) {
+		const code = value.charCodeAt(index);
+		if (code < 48 || code > 57) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function daysInMonth(year: number, month: number): number {
+	switch (month) {
+		case 1:
+		case 3:
+		case 5:
+		case 7:
+		case 8:
+		case 10:
+		case 12:
+			return 31;
+		case 4:
+		case 6:
+		case 9:
+		case 11:
+			return 30;
+		case 2:
+			return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+		default:
+			return 0;
+	}
+}
+
+function parseIsoTimestampMs(value: string): number {
+	const length = value.length;
+	if (
+		(length !== 20 && length !== 24) ||
+		value.charCodeAt(length - 1) !== 90 ||
+		value.charCodeAt(4) !== 45 ||
+		value.charCodeAt(7) !== 45 ||
+		value.charCodeAt(10) !== 84 ||
+		value.charCodeAt(13) !== 58 ||
+		value.charCodeAt(16) !== 58 ||
+		(length === 24 && value.charCodeAt(19) !== 46) ||
+		!hasAsciiDigits(value, 0, 4) ||
+		!hasAsciiDigits(value, 5, 7) ||
+		!hasAsciiDigits(value, 8, 10) ||
+		!hasAsciiDigits(value, 11, 13) ||
+		!hasAsciiDigits(value, 14, 16) ||
+		!hasAsciiDigits(value, 17, 19) ||
+		(length === 24 && !hasAsciiDigits(value, 20, 23))
+	) {
+		return Number.NaN;
+	}
+
+	const year = parseFourDigits(value, 0);
+	const month = parseTwoDigits(value, 5);
+	const day = parseTwoDigits(value, 8);
+	const hour = parseTwoDigits(value, 11);
+	const minute = parseTwoDigits(value, 14);
+	const second = parseTwoDigits(value, 17);
+	const millisecond =
+		length === 24
+			? (value.charCodeAt(20) - 48) * 100 +
+				(value.charCodeAt(21) - 48) * 10 +
+				(value.charCodeAt(22) - 48)
+			: 0;
+	if (
+		month < 1 ||
+		month > 12 ||
+		day < 1 ||
+		day > daysInMonth(year, month) ||
+		hour > 23 ||
+		minute > 59 ||
+		second > 59 ||
+		millisecond > 999
+	) {
+		return Number.NaN;
+	}
+
+	return Date.UTC(year, month - 1, day, hour, minute, second, millisecond);
+}
+
+function dateFromIsoTimestamp(value: string): Date | null {
+	const timestamp = parseIsoTimestampMs(value);
+	return Number.isNaN(timestamp) ? null : new Date(timestamp);
+}
+
+function getJSONLFileReadConcurrency(fileCount: number, singleThread = false): number {
+	if (singleThread) {
+		return 1;
+	}
+
+	const configured = Number.parseInt(process.env.CCUSAGE_JSONL_READ_CONCURRENCY ?? '', 10);
+	if (Number.isFinite(configured) && configured > 0) {
+		return Math.max(1, Math.min(fileCount, configured));
+	}
+
+	return Math.max(1, Math.min(fileCount, os.availableParallelism()));
+}
+
+function getDefaultJSONLWorkerThreadCount(fileCount: number, preferMoreWorkers = false): number {
+	const available = os.availableParallelism();
+	// Daily/session workloads mostly fan out independent usage-row parsing, so they can use more
+	// cores. Blocks return heavier per-file payloads and spend more time merging, where extra
+	// workers can lose to startup and structured-clone overhead.
+	const workerCount = Math.min(
+		preferMoreWorkers ? Math.ceil(available * 0.75) : Math.ceil(available / 2),
+		JSONL_WORKER_THREAD_LIMIT,
+	);
+	return Math.min(fileCount, Math.max(1, workerCount));
+}
+
+function getTimestampFromLine(line: string): Date | null {
+	const timestamp = extractStringMarker(line, TIMESTAMP_MARKER);
+	if (timestamp != null) {
+		const date = dateFromIsoTimestamp(timestamp);
+		if (date != null) {
+			return date;
+		}
+	}
+
+	if (!line.includes('"timestamp"')) {
+		return null;
+	}
+
+	try {
+		const json = JSON.parse(line) as Record<string, unknown>;
+		if (typeof json.timestamp !== 'string') {
+			return null;
+		}
+		const date = dateFromIsoTimestamp(json.timestamp) ?? new Date(json.timestamp);
+		return Number.isNaN(date.getTime()) ? null : date;
+	} catch {
+		return null;
+	}
+}
 
 /**
  * Get Claude data directories to search for usage data
@@ -191,6 +368,404 @@ export const usageDataSchema = v.object({
 	isApiErrorMessage: v.optional(v.boolean()),
 });
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+	return value === undefined || typeof value === 'string';
+}
+
+function isOptionalNonEmptyString(value: unknown): value is string | undefined {
+	return value === undefined || (typeof value === 'string' && value.length > 0);
+}
+
+function isOptionalNumber(value: unknown): value is number | undefined {
+	return value === undefined || typeof value === 'number';
+}
+
+function isOptionalBoolean(value: unknown): value is boolean | undefined {
+	return value === undefined || typeof value === 'boolean';
+}
+
+function sumUsageTokens(usage: UsageData['message']['usage']): number {
+	return (
+		usage.input_tokens +
+		usage.output_tokens +
+		(usage.cache_creation_input_tokens ?? 0) +
+		(usage.cache_read_input_tokens ?? 0)
+	);
+}
+
+function formatUsageModelName(
+	model: UsageData['message']['model'],
+	speed: UsageData['message']['usage']['speed'],
+): string | undefined {
+	return model == null ? undefined : speed === 'fast' ? `${model}-fast` : model;
+}
+
+function formatUsageModelNameOrUnknown(
+	model: UsageData['message']['model'],
+	speed: UsageData['message']['usage']['speed'],
+): string {
+	return formatUsageModelName(model, speed) ?? 'unknown';
+}
+
+function parseUsageDataFast(value: unknown): UsageData | null {
+	if (!isRecord(value)) {
+		return null;
+	}
+	if (
+		!isOptionalString(value.cwd) ||
+		!isOptionalNonEmptyString(value.sessionId) ||
+		!isOptionalNonEmptyString(value.requestId) ||
+		!isOptionalNumber(value.costUSD) ||
+		!isOptionalBoolean(value.isApiErrorMessage)
+	) {
+		return null;
+	}
+	if (
+		value.version !== undefined &&
+		(typeof value.version !== 'string' || !VERSION_PATTERN.test(value.version))
+	) {
+		return null;
+	}
+	if (typeof value.timestamp !== 'string' || !ISO_TIMESTAMP_PATTERN.test(value.timestamp)) {
+		return null;
+	}
+	if (!isRecord(value.message)) {
+		return null;
+	}
+	if (
+		!isOptionalNonEmptyString(value.message.model) ||
+		!isOptionalNonEmptyString(value.message.id)
+	) {
+		return null;
+	}
+	if (value.message.content !== undefined) {
+		if (!Array.isArray(value.message.content)) {
+			return null;
+		}
+		for (const part of value.message.content) {
+			if (!isRecord(part) || !isOptionalString(part.text)) {
+				return null;
+			}
+		}
+	}
+	if (!isRecord(value.message.usage)) {
+		return null;
+	}
+	const { usage } = value.message;
+	if (
+		typeof usage.input_tokens !== 'number' ||
+		typeof usage.output_tokens !== 'number' ||
+		!isOptionalNumber(usage.cache_creation_input_tokens) ||
+		!isOptionalNumber(usage.cache_read_input_tokens) ||
+		(usage.speed !== undefined && usage.speed !== 'standard' && usage.speed !== 'fast')
+	) {
+		return null;
+	}
+
+	return value as UsageData;
+}
+
+function extractStringMarker(line: string, marker: string, fromIndex = 0): string | undefined {
+	const start = line.indexOf(marker, fromIndex);
+	if (start === -1) {
+		return undefined;
+	}
+	const valueStart = start + marker.length;
+	const valueEnd = line.indexOf('"', valueStart);
+	return valueEnd === -1 ? undefined : line.slice(valueStart, valueEnd);
+}
+
+/**
+ * Parse the numeric JSON value after a known field marker without allocating a substring.
+ *
+ * `costUSD` is absent on most local Claude rows, but when present it sits on the usage hot path.
+ * The manual parser keeps that path compatible with JSON number forms, including signs, decimals,
+ * and exponents, while avoiding `Number(line.slice(...))` allocation for every matched row. A local
+ * mitata check measured this shape about 1.6x faster than slicing before `Number()`.
+ */
+function extractJsonNumberMarker(line: string, marker: string, fromIndex = 0): number | undefined {
+	const start = line.indexOf(marker, fromIndex);
+	if (start === -1) {
+		return undefined;
+	}
+
+	let valueIndex = start + marker.length;
+	let sign = 1;
+	const signCode = line.charCodeAt(valueIndex);
+	if (signCode === 45) {
+		sign = -1;
+		valueIndex++;
+	} else if (signCode === 43) {
+		valueIndex++;
+	}
+
+	let value = 0;
+	let digitCount = 0;
+	while (valueIndex < line.length) {
+		const digit = line.charCodeAt(valueIndex) - 48;
+		if (digit < 0 || digit > 9) {
+			break;
+		}
+		value = value * 10 + digit;
+		valueIndex++;
+		digitCount++;
+	}
+
+	if (line.charCodeAt(valueIndex) === 46) {
+		valueIndex++;
+		let scale = 0.1;
+		while (valueIndex < line.length) {
+			const digit = line.charCodeAt(valueIndex) - 48;
+			if (digit < 0 || digit > 9) {
+				break;
+			}
+			value += digit * scale;
+			scale *= 0.1;
+			valueIndex++;
+			digitCount++;
+		}
+	}
+
+	if (digitCount === 0) {
+		return undefined;
+	}
+
+	const exponentMarker = line.charCodeAt(valueIndex);
+	if (exponentMarker === 69 || exponentMarker === 101) {
+		valueIndex++;
+		let exponentSign = 1;
+		const exponentSignCode = line.charCodeAt(valueIndex);
+		if (exponentSignCode === 45) {
+			exponentSign = -1;
+			valueIndex++;
+		} else if (exponentSignCode === 43) {
+			valueIndex++;
+		}
+
+		let exponent = 0;
+		let exponentDigitCount = 0;
+		while (valueIndex < line.length) {
+			const digit = line.charCodeAt(valueIndex) - 48;
+			if (digit < 0 || digit > 9) {
+				break;
+			}
+			exponent = exponent * 10 + digit;
+			valueIndex++;
+			exponentDigitCount++;
+		}
+		if (exponentDigitCount === 0) {
+			return undefined;
+		}
+		value *= 10 ** (exponentSign * exponent);
+	}
+
+	value *= sign;
+	return Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Parse token counters after a known field marker without slicing.
+ *
+ * Token fields are required for every fast-path usage row, so this avoids a small allocation in the
+ * tightest parser loop. It intentionally accepts unsigned integer JSON values only; anything else
+ * falls back by returning `undefined`, matching the surrounding fast parser's conservative contract.
+ */
+function extractUnsignedIntegerMarker(
+	line: string,
+	marker: string,
+	fromIndex = 0,
+): number | undefined {
+	const start = line.indexOf(marker, fromIndex);
+	if (start === -1) {
+		return undefined;
+	}
+
+	let valueIndex = start + marker.length;
+	let value = 0;
+	let hasDigit = false;
+	while (valueIndex < line.length) {
+		const digit = line.charCodeAt(valueIndex) - 48;
+		if (digit < 0 || digit > 9) {
+			break;
+		}
+		value = value * 10 + digit;
+		valueIndex++;
+		hasDigit = true;
+	}
+
+	return hasDigit ? value : undefined;
+}
+
+/**
+ * Parse the common Claude assistant usage row without building a full JSON object.
+ *
+ * The hot path is dominated by JSONL rows with stable field names and numeric token counters.
+ * Extracting only those fields keeps the common case cheap, while returning null lets the caller
+ * fall back to JSON.parse for uncommon shapes such as null-bearing rows and API error messages.
+ */
+function parseUsageDataLineFast(
+	line: string,
+	allowContent = false,
+	usageMarkerIndex?: number,
+): UsageData | null {
+	const messageStart = line.indexOf('"message":{');
+	const usageStart =
+		usageMarkerIndex != null && usageMarkerIndex >= messageStart
+			? usageMarkerIndex
+			: line.indexOf(USAGE_LINE_MARKER, messageStart);
+	if (messageStart === -1 || usageStart === -1) {
+		return null;
+	}
+
+	// The fast path only accepts Claude assistant rows. Anchor the content check inside the
+	// message object so unrelated earlier JSON fields do not force a full-line marker scan.
+	const contentIndex = line.indexOf(CONTENT_MARKER, messageStart);
+	if (
+		(contentIndex !== -1 &&
+			(!allowContent || line.charCodeAt(contentIndex + CONTENT_MARKER.length) !== 91)) ||
+		line.includes('"isApiErrorMessage":true') ||
+		hasUnsupportedNullField(line)
+	) {
+		return null;
+	}
+
+	const timestamp = extractStringMarker(line, TIMESTAMP_MARKER);
+	if (timestamp == null || !ISO_TIMESTAMP_PATTERN.test(timestamp)) {
+		return null;
+	}
+
+	const roleStart = line.indexOf('"role":"assistant"', messageStart);
+	if (roleStart === -1 || roleStart > usageStart) {
+		return null;
+	}
+
+	const inputTokens = extractUnsignedIntegerMarker(line, INPUT_TOKENS_MARKER, usageStart);
+	const outputTokens = extractUnsignedIntegerMarker(line, OUTPUT_TOKENS_MARKER, usageStart);
+	if (inputTokens == null || outputTokens == null) {
+		return null;
+	}
+
+	const speed = extractStringMarker(line, SPEED_MARKER, usageStart);
+	if (speed != null && speed !== 'standard' && speed !== 'fast') {
+		return null;
+	}
+
+	const version = extractStringMarker(line, VERSION_MARKER, usageStart);
+	if (version != null && !VERSION_PATTERN.test(version)) {
+		return null;
+	}
+	const model = extractStringMarker(line, MODEL_MARKER, messageStart);
+	const messageId = extractStringMarker(line, MESSAGE_ID_MARKER, messageStart);
+	const requestId = extractStringMarker(line, REQUEST_ID_MARKER, usageStart);
+	if (model === '' || messageId === '' || requestId === '') {
+		return null;
+	}
+
+	return {
+		timestamp: timestamp as UsageData['timestamp'],
+		message: {
+			usage: {
+				input_tokens: inputTokens,
+				output_tokens: outputTokens,
+				cache_creation_input_tokens: extractUnsignedIntegerMarker(
+					line,
+					CACHE_CREATION_INPUT_TOKENS_MARKER,
+					usageStart,
+				),
+				cache_read_input_tokens: extractUnsignedIntegerMarker(
+					line,
+					CACHE_READ_INPUT_TOKENS_MARKER,
+					usageStart,
+				),
+				speed,
+			},
+			model: model as ModelName | undefined,
+			id: messageId as UsageData['message']['id'],
+		},
+		costUSD: extractJsonNumberMarker(line, COST_USD_MARKER, usageStart),
+		requestId: requestId as UsageData['requestId'],
+		version: version as Version | undefined,
+	};
+}
+
+/**
+ * Detect nulls only for fields that would change the fast parser's semantics.
+ *
+ * A broad regexp is easy to read but expensive across large logs. Scanning `:null` occurrences keeps
+ * unrelated nullable JSON fields on the fast path and sends only schema-sensitive nulls to the full
+ * parser.
+ */
+function hasUnsupportedNullField(line: string): boolean {
+	let nullIndex = line.indexOf(':null');
+	while (nullIndex !== -1) {
+		let fieldEnd = nullIndex - 1;
+		if (line.charCodeAt(fieldEnd) !== 34) {
+			while (fieldEnd >= 0 && line.charCodeAt(fieldEnd) !== 34) {
+				fieldEnd--;
+			}
+		}
+		if (fieldEnd !== -1) {
+			let fieldStart = fieldEnd - 1;
+			while (fieldStart >= 0 && line.charCodeAt(fieldStart) !== 34) {
+				fieldStart--;
+			}
+			if (fieldStart !== -1 && isUnsupportedNullableField(line, fieldStart + 1, fieldEnd)) {
+				return true;
+			}
+		}
+		nullIndex = line.indexOf(':null', nullIndex + 5);
+	}
+	return false;
+}
+
+function isFieldAt(line: string, start: number, end: number, field: string): boolean {
+	return end - start === field.length && line.startsWith(field, start);
+}
+
+function isUnsupportedNullableField(line: string, start: number, end: number): boolean {
+	switch (end - start) {
+		case 2:
+			return isFieldAt(line, start, end, 'id');
+		case 3:
+			return isFieldAt(line, start, end, 'cwd');
+		case 5:
+			return isFieldAt(line, start, end, 'model') || isFieldAt(line, start, end, 'speed');
+		case 7:
+			return isFieldAt(line, start, end, 'costUSD') || isFieldAt(line, start, end, 'version');
+		case 9:
+			return isFieldAt(line, start, end, 'sessionId') || isFieldAt(line, start, end, 'requestId');
+		case 17:
+			return isFieldAt(line, start, end, 'isApiErrorMessage');
+		case 23:
+			return isFieldAt(line, start, end, 'cache_read_input_tokens');
+		case 27:
+			return isFieldAt(line, start, end, 'cache_creation_input_tokens');
+		default:
+			return false;
+	}
+}
+
+function parseUsageDataLine(
+	line: string,
+	options?: { allowContentFast?: boolean; usageMarkerIndex?: number },
+): UsageData | null {
+	const fastData = parseUsageDataLineFast(
+		line,
+		options?.allowContentFast !== false,
+		options?.usageMarkerIndex,
+	);
+	if (fastData != null) {
+		return fastData;
+	}
+
+	const parsed = JSON.parse(line) as unknown;
+	return parseUsageDataFast(parsed);
+}
+
 /**
  * Valibot schema for transcript usage data from Claude messages
  */
@@ -216,126 +791,118 @@ export const transcriptMessageSchema = v.object({
 /**
  * Type definition for Claude usage data entries from JSONL files
  */
-export type UsageData = v.InferOutput<typeof usageDataSchema>;
-
-/**
- * Valibot schema for model-specific usage breakdown data
- */
-export const modelBreakdownSchema = v.object({
-	modelName: modelNameSchema,
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	cost: v.number(),
-});
+export type UsageData = {
+	cwd?: string;
+	sessionId?: SessionId;
+	timestamp: ISOTimestamp;
+	version?: Version;
+	message: {
+		usage: {
+			input_tokens: number;
+			output_tokens: number;
+			cache_creation_input_tokens?: number;
+			cache_read_input_tokens?: number;
+			speed?: 'standard' | 'fast';
+		};
+		model?: ModelName;
+		id?: MessageId;
+		content?: Array<{
+			text?: string;
+		}>;
+	};
+	costUSD?: number;
+	requestId?: RequestId;
+	isApiErrorMessage?: boolean;
+};
 
 /**
  * Type definition for model-specific usage breakdown
  */
-export type ModelBreakdown = v.InferOutput<typeof modelBreakdownSchema>;
-
-/**
- * Valibot schema for daily usage aggregation data
- */
-export const dailyUsageSchema = v.object({
-	date: dailyDateSchema, // YYYY-MM-DD format
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	totalCost: v.number(),
-	modelsUsed: v.array(modelNameSchema),
-	modelBreakdowns: v.array(modelBreakdownSchema),
-	project: v.optional(v.string()), // Project name when groupByProject is enabled
-});
+export type ModelBreakdown = {
+	modelName: ModelName;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	cost: number;
+};
 
 /**
  * Type definition for daily usage aggregation
  */
-export type DailyUsage = v.InferOutput<typeof dailyUsageSchema>;
-
-/**
- * Valibot schema for session-based usage aggregation data
- */
-export const sessionUsageSchema = v.object({
-	sessionId: sessionIdSchema,
-	projectPath: projectPathSchema,
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	totalCost: v.number(),
-	lastActivity: activityDateSchema,
-	versions: v.array(versionSchema), // List of unique versions used in this session
-	modelsUsed: v.array(modelNameSchema),
-	modelBreakdowns: v.array(modelBreakdownSchema),
-});
+export type DailyUsage = {
+	date: DailyDate;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	totalCost: number;
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+	project?: string;
+};
 
 /**
  * Type definition for session-based usage aggregation
  */
-export type SessionUsage = v.InferOutput<typeof sessionUsageSchema>;
-
-/**
- * Valibot schema for monthly usage aggregation data
- */
-export const monthlyUsageSchema = v.object({
-	month: monthlyDateSchema, // YYYY-MM format
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	totalCost: v.number(),
-	modelsUsed: v.array(modelNameSchema),
-	modelBreakdowns: v.array(modelBreakdownSchema),
-	project: v.optional(v.string()), // Project name when groupByProject is enabled
-});
+export type SessionUsage = {
+	sessionId: SessionId;
+	projectPath: ProjectPath;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	totalCost: number;
+	lastActivity: ActivityDate;
+	versions: Version[];
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+};
 
 /**
  * Type definition for monthly usage aggregation
  */
-export type MonthlyUsage = v.InferOutput<typeof monthlyUsageSchema>;
-
-/**
- * Valibot schema for weekly usage aggregation data
- */
-export const weeklyUsageSchema = v.object({
-	week: weeklyDateSchema, // YYYY-MM-DD format
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	totalCost: v.number(),
-	modelsUsed: v.array(modelNameSchema),
-	modelBreakdowns: v.array(modelBreakdownSchema),
-	project: v.optional(v.string()), // Project name when groupByProject is enabled
-});
+export type MonthlyUsage = {
+	month: MonthlyDate;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	totalCost: number;
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+	project?: string;
+};
 
 /**
  * Type definition for weekly usage aggregation
  */
-export type WeeklyUsage = v.InferOutput<typeof weeklyUsageSchema>;
-
-/**
- * Valibot schema for bucket usage aggregation data
- */
-export const bucketUsageSchema = v.object({
-	bucket: v.union([weeklyDateSchema, monthlyDateSchema]), // WeeklyDate or MonthlyDate
-	inputTokens: v.number(),
-	outputTokens: v.number(),
-	cacheCreationTokens: v.number(),
-	cacheReadTokens: v.number(),
-	totalCost: v.number(),
-	modelsUsed: v.array(modelNameSchema),
-	modelBreakdowns: v.array(modelBreakdownSchema),
-	project: v.optional(v.string()), // Project name when groupByProject is enabled
-});
+export type WeeklyUsage = {
+	week: WeeklyDate;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	totalCost: number;
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+	project?: string;
+};
 
 /**
  * Type definition for bucket usage aggregation
  */
-export type BucketUsage = v.InferOutput<typeof bucketUsageSchema>;
+export type BucketUsage = {
+	bucket: Bucket;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	totalCost: number;
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+	project?: string;
+};
 
 /**
  * Internal type for aggregating token statistics and costs
@@ -348,132 +915,196 @@ type TokenStats = {
 	cost: number;
 };
 
+type UsageSummary = TokenStats & {
+	totalCost: number;
+	modelsUsed: ModelName[];
+	modelBreakdowns: ModelBreakdown[];
+};
+
+type TokenStatsIndex = Record<string, TokenStats | undefined>;
+type ModelSeenIndex = Record<string, true | undefined>;
+
+type UsageSummaryAccumulator = {
+	totals: TokenStats & { totalCost: number };
+	modelAggregates: TokenStatsIndex;
+	modelSeen: ModelSeenIndex;
+	modelsUsed: string[];
+};
+
+type BunFileLike = {
+	size: number;
+	bytes: () => Promise<Uint8Array>;
+	text: () => Promise<string>;
+};
+
+type BunRuntimeLike = {
+	file: (path: string) => BunFileLike;
+};
+
 function getDisplayModelName(data: UsageData): string | undefined {
-	const model = data.message.model;
-	if (model == null) {
-		return undefined;
-	}
-	return data.message.usage.speed === 'fast' ? `${model}-fast` : model;
+	return formatUsageModelName(data.message.model, data.message.usage.speed);
+}
+
+function createEmptyTokenStats(): TokenStats {
+	return {
+		inputTokens: 0,
+		outputTokens: 0,
+		cacheCreationTokens: 0,
+		cacheReadTokens: 0,
+		cost: 0,
+	};
 }
 
 /**
- * Aggregates token counts and costs by model name
+ * Create a null-prototype model aggregate lookup for summary hot paths.
+ *
+ * Model names are plain strings and summary aggregation only needs exact-key lookup. This mirrors
+ * the dedupe-index optimization while keeping arbitrary model names safe from inherited keys.
  */
-function aggregateByModel<T>(
+function createTokenStatsIndex(): TokenStatsIndex {
+	return Object.create(null) as TokenStatsIndex;
+}
+
+/**
+ * Track model names without allocating a Set for every daily/session/bucket group.
+ *
+ * Reports need insertion-order `modelsUsed` output plus O(1) membership checks. A null-prototype
+ * object stores membership and a side array preserves the same first-seen order that Set had.
+ */
+function addModelUsed(accumulator: UsageSummaryAccumulator, modelName: string): void {
+	if (accumulator.modelSeen[modelName] != null) {
+		return;
+	}
+	accumulator.modelSeen[modelName] = true;
+	accumulator.modelsUsed.push(modelName);
+}
+
+function addUsageToTokenStats(
+	stats: TokenStats,
+	usage: UsageData['message']['usage'],
+	cost: number,
+): void {
+	stats.inputTokens += usage.input_tokens ?? 0;
+	stats.outputTokens += usage.output_tokens ?? 0;
+	stats.cacheCreationTokens += usage.cache_creation_input_tokens ?? 0;
+	stats.cacheReadTokens += usage.cache_read_input_tokens ?? 0;
+	stats.cost += cost;
+}
+
+function createUsageSummaryAccumulator(): UsageSummaryAccumulator {
+	return {
+		totals: {
+			...createEmptyTokenStats(),
+			totalCost: 0,
+		},
+		modelAggregates: createTokenStatsIndex(),
+		modelSeen: Object.create(null) as ModelSeenIndex,
+		modelsUsed: [],
+	};
+}
+
+function addUsageToSummaryAccumulator(
+	accumulator: UsageSummaryAccumulator,
+	model: string | undefined,
+	usage: UsageData['message']['usage'],
+	cost: number,
+): void {
+	const modelName = model ?? 'unknown';
+	addUsageToTokenStats(accumulator.totals, usage, cost);
+	accumulator.totals.totalCost += cost;
+
+	if (modelName === '<synthetic>') {
+		return;
+	}
+
+	if (model != null) {
+		addModelUsed(accumulator, modelName);
+	}
+
+	let existing = accumulator.modelAggregates[modelName];
+	if (existing == null) {
+		existing = createEmptyTokenStats();
+		accumulator.modelAggregates[modelName] = existing;
+	}
+	addUsageToTokenStats(existing, usage, cost);
+}
+
+function addTokenFieldsToSummaryAccumulator(
+	accumulator: UsageSummaryAccumulator,
+	model: string | undefined,
+	tokens: {
+		inputTokens: number;
+		outputTokens: number;
+		cacheCreationTokens: number;
+		cacheReadTokens: number;
+	},
+	cost: number,
+): void {
+	const modelName = model ?? 'unknown';
+	accumulator.totals.inputTokens += tokens.inputTokens;
+	accumulator.totals.outputTokens += tokens.outputTokens;
+	accumulator.totals.cacheCreationTokens += tokens.cacheCreationTokens;
+	accumulator.totals.cacheReadTokens += tokens.cacheReadTokens;
+	accumulator.totals.cost += cost;
+	accumulator.totals.totalCost += cost;
+
+	if (modelName === '<synthetic>') {
+		return;
+	}
+
+	if (model != null) {
+		addModelUsed(accumulator, modelName);
+	}
+
+	let existing = accumulator.modelAggregates[modelName];
+	if (existing == null) {
+		existing = createEmptyTokenStats();
+		accumulator.modelAggregates[modelName] = existing;
+	}
+	existing.inputTokens += tokens.inputTokens;
+	existing.outputTokens += tokens.outputTokens;
+	existing.cacheCreationTokens += tokens.cacheCreationTokens;
+	existing.cacheReadTokens += tokens.cacheReadTokens;
+	existing.cost += cost;
+}
+
+function finalizeUsageSummary(accumulator: UsageSummaryAccumulator): UsageSummary {
+	return {
+		...accumulator.totals,
+		modelsUsed: accumulator.modelsUsed as ModelName[],
+		modelBreakdowns: createModelBreakdowns(accumulator.modelAggregates),
+	};
+}
+
+function summarizeUsageEntries<T>(
 	entries: T[],
 	getModel: (entry: T) => string | undefined,
 	getUsage: (entry: T) => UsageData['message']['usage'],
 	getCost: (entry: T) => number,
-): Map<string, TokenStats> {
-	const modelAggregates = new Map<string, TokenStats>();
-	const defaultStats: TokenStats = {
-		inputTokens: 0,
-		outputTokens: 0,
-		cacheCreationTokens: 0,
-		cacheReadTokens: 0,
-		cost: 0,
-	};
+): UsageSummary {
+	const accumulator = createUsageSummaryAccumulator();
 
 	for (const entry of entries) {
-		const modelName = getModel(entry) ?? 'unknown';
-		// Skip synthetic model
-		if (modelName === '<synthetic>') {
-			continue;
-		}
-
-		const usage = getUsage(entry);
-		const cost = getCost(entry);
-
-		const existing = modelAggregates.get(modelName) ?? defaultStats;
-
-		modelAggregates.set(modelName, {
-			inputTokens: existing.inputTokens + (usage.input_tokens ?? 0),
-			outputTokens: existing.outputTokens + (usage.output_tokens ?? 0),
-			cacheCreationTokens: existing.cacheCreationTokens + (usage.cache_creation_input_tokens ?? 0),
-			cacheReadTokens: existing.cacheReadTokens + (usage.cache_read_input_tokens ?? 0),
-			cost: existing.cost + cost,
-		});
+		addUsageToSummaryAccumulator(accumulator, getModel(entry), getUsage(entry), getCost(entry));
 	}
 
-	return modelAggregates;
-}
-
-/**
- * Aggregates model breakdowns from multiple sources
- */
-function aggregateModelBreakdowns(breakdowns: ModelBreakdown[]): Map<string, TokenStats> {
-	const modelAggregates = new Map<string, TokenStats>();
-	const defaultStats: TokenStats = {
-		inputTokens: 0,
-		outputTokens: 0,
-		cacheCreationTokens: 0,
-		cacheReadTokens: 0,
-		cost: 0,
-	};
-
-	for (const breakdown of breakdowns) {
-		// Skip synthetic model
-		if (breakdown.modelName === '<synthetic>') {
-			continue;
-		}
-
-		const existing = modelAggregates.get(breakdown.modelName) ?? defaultStats;
-
-		modelAggregates.set(breakdown.modelName, {
-			inputTokens: existing.inputTokens + breakdown.inputTokens,
-			outputTokens: existing.outputTokens + breakdown.outputTokens,
-			cacheCreationTokens: existing.cacheCreationTokens + breakdown.cacheCreationTokens,
-			cacheReadTokens: existing.cacheReadTokens + breakdown.cacheReadTokens,
-			cost: existing.cost + breakdown.cost,
-		});
-	}
-
-	return modelAggregates;
+	return finalizeUsageSummary(accumulator);
 }
 
 /**
  * Converts model aggregates to sorted model breakdowns
  */
-function createModelBreakdowns(modelAggregates: Map<string, TokenStats>): ModelBreakdown[] {
-	return Array.from(modelAggregates.entries())
-		.map(([modelName, stats]) => ({
+function createModelBreakdowns(modelAggregates: TokenStatsIndex): ModelBreakdown[] {
+	const modelNames = Object.keys(modelAggregates);
+	const breakdowns: ModelBreakdown[] = [];
+	for (let index = 0; index < modelNames.length; index++) {
+		const modelName = modelNames[index]!;
+		breakdowns.push({
 			modelName: modelName as ModelName,
-			...stats,
-		}))
-		.sort((a, b) => b.cost - a.cost); // Sort by cost descending
-}
-
-/**
- * Calculates total token counts and costs from entries
- */
-function calculateTotals<T>(
-	entries: T[],
-	getUsage: (entry: T) => UsageData['message']['usage'],
-	getCost: (entry: T) => number,
-): TokenStats & { totalCost: number } {
-	return entries.reduce(
-		(acc, entry) => {
-			const usage = getUsage(entry);
-			const cost = getCost(entry);
-
-			return {
-				inputTokens: acc.inputTokens + (usage.input_tokens ?? 0),
-				outputTokens: acc.outputTokens + (usage.output_tokens ?? 0),
-				cacheCreationTokens: acc.cacheCreationTokens + (usage.cache_creation_input_tokens ?? 0),
-				cacheReadTokens: acc.cacheReadTokens + (usage.cache_read_input_tokens ?? 0),
-				cost: acc.cost + cost,
-				totalCost: acc.totalCost + cost,
-			};
-		},
-		{
-			inputTokens: 0,
-			outputTokens: 0,
-			cacheCreationTokens: 0,
-			cacheReadTokens: 0,
-			cost: 0,
-			totalCost: 0,
-		},
-	);
+			...modelAggregates[modelName]!,
+		});
+	}
+	return breakdowns.sort((a, b) => b.cost - a.cost); // Sort by cost descending
 }
 
 /**
@@ -494,35 +1125,85 @@ function filterByProject<T>(
 	});
 }
 
-/**
- * Checks if an entry is a duplicate based on hash
- */
-function isDuplicateEntry(uniqueHash: string | null, processedHashes: Set<string>): boolean {
-	if (uniqueHash == null) {
-		return false;
-	}
-	return processedHashes.has(uniqueHash);
-}
+async function mapWithConcurrency<T, U>(
+	items: T[],
+	concurrency: number,
+	mapper: (item: T, index: number) => Promise<U>,
+): Promise<U[]> {
+	const results = createResultSlots<U>(items.length);
+	let nextIndex = 0;
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
 
-/**
- * Marks an entry as processed
- */
-function markAsProcessed(uniqueHash: string | null, processedHashes: Set<string>): void {
-	if (uniqueHash != null) {
-		processedHashes.add(uniqueHash);
-	}
-}
-
-/**
- * Extracts unique models from entries, excluding synthetic model
- */
-function extractUniqueModels<T>(
-	entries: T[],
-	getModel: (entry: T) => string | undefined,
-): string[] {
-	return Array.from(
-		new Set(entries.map(getModel).filter((m): m is string => m != null && m !== '<synthetic>')),
+	await Promise.all(
+		Array.from({ length: workerCount }, async () => {
+			// Each async runner claims the next index from the shared counter until work is exhausted.
+			while (true) {
+				const index = nextIndex++;
+				if (index >= items.length) {
+					return;
+				}
+				results[index] = await mapper(items[index]!, index);
+			}
+		}),
 	);
+
+	return results;
+}
+
+function parseCompactDate(value: string | undefined): Date | null {
+	if (value == null || !/^\d{8}$/.test(value)) {
+		return null;
+	}
+
+	const year = Number.parseInt(value.slice(0, 4), 10);
+	const month = Number.parseInt(value.slice(4, 6), 10);
+	const day = Number.parseInt(value.slice(6, 8), 10);
+	const date = new Date(Date.UTC(year, month - 1, day));
+
+	if (
+		date.getUTCFullYear() !== year ||
+		date.getUTCMonth() !== month - 1 ||
+		date.getUTCDate() !== day
+	) {
+		return null;
+	}
+
+	return date;
+}
+
+async function filterFilesByMtime<T>(
+	items: T[],
+	getFilePath: (item: T) => string,
+	since?: string,
+	minUpdateTime?: Date,
+): Promise<T[]> {
+	const sinceDate = parseCompactDate(since);
+	const thresholdMsList: number[] = [];
+
+	if (sinceDate != null) {
+		sinceDate.setUTCDate(sinceDate.getUTCDate() - 1);
+		thresholdMsList.push(sinceDate.getTime());
+	}
+	if (minUpdateTime != null && !Number.isNaN(minUpdateTime.getTime())) {
+		thresholdMsList.push(minUpdateTime.getTime());
+	}
+	if (thresholdMsList.length === 0) {
+		return items;
+	}
+
+	const thresholdMs = Math.max(...thresholdMsList);
+	const keepFlags = await Promise.all(
+		items.map(async (item) => {
+			try {
+				const stats = await stat(getFilePath(item));
+				return stats.mtimeMs >= thresholdMs;
+			} catch {
+				return true;
+			}
+		}),
+	);
+
+	return items.filter((_, index) => keepFlags[index] === true);
 }
 
 /**
@@ -540,6 +1221,167 @@ export function createUniqueHash(data: UsageData): string | null {
 	return `${messageId}:${requestId}`;
 }
 
+function hasNonWhitespace(line: string): boolean {
+	for (let index = 0; index < line.length; index++) {
+		if (line.charCodeAt(index) > 32) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function getBunRuntime(): BunRuntimeLike | null {
+	const runtime = (globalThis as { Bun?: Partial<BunRuntimeLike> }).Bun;
+	return typeof runtime?.file === 'function' ? (runtime as BunRuntimeLike) : null;
+}
+
+async function processBufferedJSONLContent(
+	content: string,
+	processLine: (line: string, lineNumber: number) => void | Promise<void>,
+): Promise<void> {
+	let lineStart = 0;
+	let lineNumber = 0;
+	while (lineStart < content.length) {
+		let lineEnd = content.indexOf('\n', lineStart);
+		if (lineEnd === -1) {
+			lineEnd = content.length;
+		}
+
+		lineNumber++;
+		let line = content.slice(lineStart, lineEnd);
+		if (line.endsWith('\r')) {
+			line = line.slice(0, -1);
+		}
+		if (hasNonWhitespace(line)) {
+			const result = processLine(line, lineNumber);
+			if (result != null) {
+				await result;
+			}
+		}
+
+		lineStart = lineEnd + 1;
+	}
+}
+
+async function processBufferedJSONLUsageContent(
+	content: string,
+	processLine: (line: string, usageMarkerIndex: number) => void,
+): Promise<void> {
+	let lineStart = 0;
+	let markerIndex = content.indexOf(USAGE_LINE_MARKER, lineStart);
+	while (markerIndex !== -1) {
+		// The marker search skips non-usage lines, so lineStart can lag behind markerIndex.
+		// Advance it monotonically instead of reverse-scanning with lastIndexOf for every usage row.
+		while (true) {
+			const nextLineEnd = content.indexOf('\n', lineStart);
+			if (nextLineEnd === -1 || nextLineEnd >= markerIndex) {
+				break;
+			}
+			lineStart = nextLineEnd + 1;
+		}
+		let lineEnd = content.indexOf('\n', markerIndex);
+		if (lineEnd === -1) {
+			lineEnd = content.length;
+		}
+
+		let line = content.slice(lineStart, lineEnd);
+		if (line.endsWith('\r')) {
+			line = line.slice(0, -1);
+		}
+		// The scanner already paid for the usage marker search; pass the line-relative offset so
+		// the fast parser does not run the same indexOf again for every usage row.
+		processLine(line, markerIndex - lineStart);
+
+		lineStart = lineEnd + 1;
+		markerIndex = content.indexOf(USAGE_LINE_MARKER, lineStart);
+	}
+}
+
+/**
+ * Scan buffered JSONL as bytes and decode only lines that contain a usage marker.
+ *
+ * Real Claude logs contain many non-usage rows. Keeping the file as bytes lets Bun search for the
+ * marker without converting the whole file to UTF-16, then `toString()` is paid only for candidate
+ * usage lines that the fast parser or JSON fallback can consume.
+ */
+async function processBufferedJSONLUsageBytes(
+	bytes: Uint8Array,
+	processLine: (line: string, usageMarkerIndex: number) => void,
+): Promise<void> {
+	const content = Buffer.isBuffer(bytes)
+		? bytes
+		: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	let lineStart = 0;
+	let markerIndex = content.indexOf(USAGE_LINE_MARKER_BUFFER, lineStart);
+	while (markerIndex !== -1) {
+		// Advance to the start of the marker's line without calling lastIndexOf for every usage row.
+		// This loop is monotonic: each newline is considered at most once across the whole buffer.
+		while (true) {
+			const nextLineEnd = content.indexOf(10, lineStart);
+			if (nextLineEnd === -1 || nextLineEnd >= markerIndex) {
+				break;
+			}
+			lineStart = nextLineEnd + 1;
+		}
+		let lineEnd = content.indexOf(10, markerIndex);
+		if (lineEnd === -1) {
+			lineEnd = content.length;
+		}
+
+		const decodeEnd = lineEnd > lineStart && content[lineEnd - 1] === 13 ? lineEnd - 1 : lineEnd;
+		// Usage aggregation reads ASCII metadata and token fields only; content text is never surfaced.
+		// Latin-1 avoids UTF-8 decoding cost for large assistant content while preserving JSON markers.
+		// The scanner already paid for the usage marker search; pass the line-relative offset so
+		// the fast parser does not run the same indexOf again for every usage row.
+		processLine(content.toString('latin1', lineStart, decodeEnd), markerIndex - lineStart);
+
+		lineStart = lineEnd + 1;
+		markerIndex = content.indexOf(USAGE_LINE_MARKER_BUFFER, lineStart);
+	}
+}
+
+async function readBufferedJSONLBytes(filePath: string): Promise<Uint8Array | null> {
+	const bun = getBunRuntime();
+	if (bun != null) {
+		const file = bun.file(filePath);
+		return file.size <= MAX_BUFFERED_JSONL_BYTES ? file.bytes() : null;
+	}
+
+	// The usage-row scanner only decodes candidate lines. Keeping Node on bytes here avoids
+	// converting the whole JSONL file to a UTF-16 string before most non-usage rows are skipped.
+	const file = await open(filePath, 'r');
+	try {
+		const stats = await file.stat();
+		if (stats.size <= MAX_BUFFERED_JSONL_BYTES) {
+			return await file.readFile();
+		}
+		return null;
+	} finally {
+		await file.close();
+	}
+}
+
+async function readBufferedJSONLContent(filePath: string): Promise<string | null> {
+	const bun = getBunRuntime();
+	if (bun != null) {
+		const file = bun.file(filePath);
+		if (file.size <= MAX_BUFFERED_JSONL_BYTES) {
+			return file.text();
+		}
+	}
+
+	const file = await open(filePath, 'r');
+	try {
+		const stats = await file.stat();
+		if (stats.size <= MAX_BUFFERED_JSONL_BYTES) {
+			return (await file.readFile()).toString('utf8');
+		}
+		return null;
+	} finally {
+		await file.close();
+	}
+}
+
 /**
  * Process a JSONL file line by line using streams to avoid memory issues with large files
  * @param filePath - Path to the JSONL file
@@ -549,6 +1391,12 @@ async function processJSONLFileByLine(
 	filePath: string,
 	processLine: (line: string, lineNumber: number) => void | Promise<void>,
 ): Promise<void> {
+	const content = await readBufferedJSONLContent(filePath);
+	if (content != null) {
+		await processBufferedJSONLContent(content, processLine);
+		return;
+	}
+
 	const fileStream = createReadStream(filePath, { encoding: 'utf-8' });
 	const rl = createInterface({
 		input: fileStream,
@@ -558,10 +1406,44 @@ async function processJSONLFileByLine(
 	let lineNumber = 0;
 	for await (const line of rl) {
 		lineNumber++;
-		if (line.trim().length === 0) {
+		if (!hasNonWhitespace(line)) {
 			continue;
 		}
-		await processLine(line, lineNumber);
+		const result = processLine(line, lineNumber);
+		if (result != null) {
+			await result;
+		}
+	}
+}
+
+async function processJSONLUsageFileByLine(
+	filePath: string,
+	processLine: (line: string, usageMarkerIndex: number) => void,
+): Promise<void> {
+	const bytes = await readBufferedJSONLBytes(filePath);
+	if (bytes != null) {
+		await processBufferedJSONLUsageBytes(bytes, processLine);
+		return;
+	}
+
+	const content = await readBufferedJSONLContent(filePath);
+	if (content != null) {
+		await processBufferedJSONLUsageContent(content, processLine);
+		return;
+	}
+
+	const fileStream = createReadStream(filePath, { encoding: 'utf-8' });
+	const rl = createInterface({
+		input: fileStream,
+		crlfDelay: Number.POSITIVE_INFINITY,
+	});
+
+	for await (const line of rl) {
+		const usageMarkerIndex = line.indexOf(USAGE_LINE_MARKER);
+		if (usageMarkerIndex === -1) {
+			continue;
+		}
+		processLine(line, usageMarkerIndex);
 	}
 }
 
@@ -575,18 +1457,9 @@ export async function getEarliestTimestamp(filePath: string): Promise<Date | nul
 		let earliestDate: Date | null = null;
 
 		await processJSONLFileByLine(filePath, (line) => {
-			try {
-				const json = JSON.parse(line) as Record<string, unknown>;
-				if (json.timestamp != null && typeof json.timestamp === 'string') {
-					const date = new Date(json.timestamp);
-					if (!Number.isNaN(date.getTime())) {
-						if (earliestDate == null || date < earliestDate) {
-							earliestDate = date;
-						}
-					}
-				}
-			} catch {
-				// Skip invalid JSON lines
+			const date = getTimestampFromLine(line);
+			if (date != null && (earliestDate == null || date < earliestDate)) {
+				earliestDate = date;
 			}
 		});
 
@@ -678,6 +1551,94 @@ export async function calculateCostForEntry(
 	unreachable(mode);
 }
 
+function getImmediateCostForEntry(data: UsageData, mode: CostMode): number | undefined {
+	if (mode === 'display') {
+		return data.costUSD ?? 0;
+	}
+
+	if (mode === 'auto' && data.costUSD != null) {
+		return data.costUSD;
+	}
+
+	return undefined;
+}
+
+type CostCalculator = (data: UsageData) => number;
+
+async function createCostCalculator(
+	mode: CostMode,
+	fetcher: PricingFetcher | null,
+	pricingOverride?: Map<string, LiteLLMModelPricing>,
+): Promise<CostCalculator> {
+	if (mode === 'display') {
+		return (data) => data.costUSD ?? 0;
+	}
+
+	if (fetcher == null && pricingOverride == null) {
+		return () => 0;
+	}
+
+	const pricing =
+		pricingOverride ??
+		Result.unwrap(await fetcher!.fetchModelPricing(), new Map<string, LiteLLMModelPricing>());
+	const pricingCalculator = fetcher ?? new PricingFetcher(true);
+	const modelPricingCache = new Map<string, LiteLLMModelPricing | null>();
+
+	const getModelPricing = (modelName: string): LiteLLMModelPricing | null => {
+		if (modelPricingCache.has(modelName)) {
+			return modelPricingCache.get(modelName) ?? null;
+		}
+
+		const direct = pricing.get(modelName);
+		if (direct != null) {
+			modelPricingCache.set(modelName, direct);
+			return direct;
+		}
+
+		for (const prefix of CLAUDE_PROVIDER_PREFIXES) {
+			const prefixed = pricing.get(`${prefix}${modelName}`);
+			if (prefixed != null) {
+				modelPricingCache.set(modelName, prefixed);
+				return prefixed;
+			}
+		}
+
+		const lower = modelName.toLowerCase();
+		for (const [key, value] of pricing) {
+			const comparison = key.toLowerCase();
+			if (comparison.includes(lower) || lower.includes(comparison)) {
+				modelPricingCache.set(modelName, value);
+				return value;
+			}
+		}
+
+		modelPricingCache.set(modelName, null);
+		return null;
+	};
+
+	return (data) => {
+		if (mode === 'auto' && data.costUSD != null) {
+			return data.costUSD;
+		}
+
+		const model = data.message.model;
+		if (model == null || model === '') {
+			return 0;
+		}
+
+		const modelPricing = getModelPricing(model);
+		if (modelPricing == null) {
+			return 0;
+		}
+
+		const baseCost = pricingCalculator.calculateCostFromPricing(data.message.usage, modelPricing);
+		return (
+			baseCost *
+			(data.message.usage.speed === 'fast' ? (modelPricing.provider_specific_entry?.fast ?? 1) : 1)
+		);
+	};
+}
+
 /**
  * Get Claude Code usage limit expiration date
  * @param data - Usage data entry
@@ -709,6 +1670,35 @@ export type GlobResult = {
 	baseDir: string;
 };
 
+export async function collectJsonlFiles(root: string): Promise<string[]> {
+	const files: string[] = [];
+	const walkDirectory = async (dir: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		let childDirectoryWalks: Array<Promise<void>> | undefined;
+		for (const entry of entries) {
+			const filePath = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				if (childDirectoryWalks == null) {
+					childDirectoryWalks = [];
+				}
+				childDirectoryWalks.push(walkDirectory(filePath));
+			} else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+				files.push(filePath);
+			}
+		}
+		if (childDirectoryWalks != null) {
+			await Promise.all(childDirectoryWalks);
+		}
+	};
+	await walkDirectory(root);
+	return files.sort(compareStrings);
+}
+
 /**
  * Glob files from multiple Claude paths in parallel
  * @param claudePaths - Array of Claude base paths
@@ -717,12 +1707,8 @@ export type GlobResult = {
 export async function globUsageFiles(claudePaths: string[]): Promise<GlobResult[]> {
 	const filePromises = claudePaths.map(async (claudePath) => {
 		const claudeDir = path.join(claudePath, CLAUDE_PROJECTS_DIR_NAME);
-		const files = await glob([USAGE_DATA_GLOB_PATTERN], {
-			cwd: claudeDir,
-			absolute: true,
-		}).catch(() => []); // Gracefully handle errors for individual paths
+		const files = await collectJsonlFiles(claudeDir);
 
-		// Map each file to include its base directory
 		return files.map((file) => ({ file, baseDir: claudeDir }));
 	});
 	return (await Promise.all(filePromises)).flat();
@@ -749,7 +1735,781 @@ export type LoadOptions = {
 	project?: string; // Filter to specific project name
 	startOfWeek?: WeekDay; // Start of week for weekly aggregation
 	timezone?: string; // Timezone for date grouping (e.g., 'UTC', 'America/New_York'). Defaults to system timezone
+	minUpdateTime?: Date; // Only process files modified after this timestamp
+	singleThread?: boolean; // Disable parallel JSONL file loading
 } & DateFilter;
+
+type DailyDataEntry = {
+	date: string;
+	cost: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	model: string | undefined;
+	project: string;
+	uniqueHash: string | null;
+	tokenTotal: number;
+	hasSpeed: boolean;
+};
+
+type EncodedDailyDataEntries = {
+	kind: 'daily-columns';
+	count: number;
+	numbers: Float64Array;
+	flags: Uint8Array;
+	project: string;
+	strings: Array<string | null>;
+};
+
+type SessionDataEntry = {
+	sessionKey: string;
+	sessionId: string;
+	projectPath: string;
+	cost: number;
+	timestamp: string;
+	model: string | undefined;
+	inputTokens: number;
+	outputTokens: number;
+	cacheCreationTokens: number;
+	cacheReadTokens: number;
+	uniqueHash: string | null;
+	tokenTotal: number;
+	hasSpeed: boolean;
+	version: Version | undefined;
+};
+
+type EncodedSessionDataEntries = {
+	kind: 'session-columns';
+	count: number;
+	numbers: Float64Array;
+	flags: Uint8Array;
+	sessionKey: string;
+	sessionId: string;
+	projectPath: string;
+	strings: Array<string | null>;
+};
+
+type BlockEntryResult = {
+	entry: LoadedUsageEntry;
+	uniqueHash: string | null;
+	tokenTotal: number;
+	hasSpeed: boolean;
+};
+
+type BlockFileResult = {
+	file: string;
+	timestampMs: number | null;
+	entries: BlockEntryResult[];
+};
+
+type DedupedEntryIndex = Record<string, number | undefined>;
+
+type DedupedBlockEntryMetadata = {
+	tokenTotal: number;
+	hasSpeed: boolean;
+	index: number;
+};
+
+type DedupedBlockEntryIndex = Record<string, DedupedBlockEntryMetadata | undefined>;
+
+/**
+ * Create a null-prototype string lookup for hot dedupe indexes.
+ *
+ * Global dedupe uses Claude message/request IDs as plain string keys and only needs exact-key
+ * lookup. Bun profiles showed native `Map#set` dominating the post-worker merge, so this avoids
+ * the Map bucket machinery while staying safe for arbitrary keys through the null prototype.
+ */
+function createDedupedEntryIndex(): DedupedEntryIndex {
+	return Object.create(null) as DedupedEntryIndex;
+}
+
+/**
+ * Create the block variant of the string lookup, which stores replacement metadata with each key.
+ */
+function createDedupedBlockEntryIndex(): DedupedBlockEntryIndex {
+	return Object.create(null) as DedupedBlockEntryIndex;
+}
+
+type EncodedBlockFileResult = {
+	kind: 'block-columns';
+	file: string;
+	timestampMs: number | null;
+	count: number;
+	numbers: Float64Array;
+	flags: Uint8Array;
+	strings: Array<string | null>;
+};
+
+type UsageWorkerTask = 'daily' | 'session' | 'blocks';
+
+type IndexedWorkerItem<T> = {
+	index: number;
+	item: T;
+};
+
+type UsageWorkerData = {
+	kind: 'ccusage:usage-worker';
+	task: UsageWorkerTask;
+	items: Array<IndexedWorkerItem<unknown>>;
+	mode: CostMode;
+	offline: boolean | undefined;
+	timezone: string | undefined;
+	pricing: Map<string, LiteLLMModelPricing> | undefined;
+};
+
+type UsageWorkerResponse<TResult> = {
+	results: Array<{
+		index: number;
+		result: TResult;
+	}>;
+};
+
+function shouldReplaceEntryMetadata(
+	candidate: { tokenTotal: number; hasSpeed: boolean },
+	existing: { tokenTotal: number; hasSpeed: boolean },
+): boolean {
+	if (candidate.tokenTotal !== existing.tokenTotal) {
+		return candidate.tokenTotal > existing.tokenTotal;
+	}
+
+	return candidate.hasSpeed && !existing.hasSpeed;
+}
+
+function markDedupedEntryMetadata(
+	processedEntries: DedupedEntryIndex,
+	entry: { uniqueHash: string | null },
+	entryIndex: number,
+): void {
+	if (entry.uniqueHash != null) {
+		processedEntries[entry.uniqueHash] = entryIndex;
+	}
+}
+
+/**
+ * Pack daily worker rows into column arrays before posting them back to the main thread.
+ *
+ * The numeric columns are transferred instead of cloned, and the string columns stay in a flat array.
+ * Each payload represents one JSONL file, so `project` is stored once instead of cloned for every
+ * row. This keeps worker messaging smaller than sending one object per parsed usage row while
+ * preserving the main-thread dedupe and aggregation rules.
+ */
+function encodeDailyDataEntries(entries: DailyDataEntry[]): EncodedDailyDataEntries {
+	const count = entries.length;
+	const numbers = new Float64Array(count * 6);
+	const flags = new Uint8Array(count);
+	const strings: Array<string | null> = [];
+	strings.length = count * 3;
+	const firstEntry = entries[0];
+
+	for (let index = 0; index < count; index++) {
+		const entry = entries[index]!;
+		const numberOffset = index * 6;
+		numbers[numberOffset] = entry.cost;
+		numbers[numberOffset + 1] = entry.inputTokens;
+		numbers[numberOffset + 2] = entry.outputTokens;
+		numbers[numberOffset + 3] = entry.cacheCreationTokens;
+		numbers[numberOffset + 4] = entry.cacheReadTokens;
+		numbers[numberOffset + 5] = entry.tokenTotal;
+		flags[index] = entry.hasSpeed ? 1 : 0;
+
+		const stringOffset = index * 3;
+		strings[stringOffset] = entry.date;
+		strings[stringOffset + 1] = entry.model ?? null;
+		strings[stringOffset + 2] = entry.uniqueHash;
+	}
+
+	return {
+		kind: 'daily-columns',
+		count,
+		numbers,
+		flags,
+		project: firstEntry?.project ?? '',
+		strings,
+	};
+}
+
+function decodeDailyDataEntries(encoded: EncodedDailyDataEntries): DailyDataEntry[] {
+	const entries: DailyDataEntry[] = [];
+	forEachDailyDataEntry(encoded, (entry) => {
+		entries.push(entry);
+	});
+	return entries;
+}
+
+/**
+ * Reconstruct daily rows from the transferred worker columns one row at a time.
+ *
+ * The worker payload deliberately separates numeric columns from string columns so the numeric
+ * buffers can be transferred instead of structured-cloned. Iterating through this helper lets the
+ * main thread feed rows directly into dedupe/aggregation without first rebuilding a large decoded
+ * array, while `decodeDailyDataEntries` keeps a full-array path available for focused tests.
+ */
+function forEachDailyDataEntry(
+	encoded: EncodedDailyDataEntries,
+	onEntry: (entry: DailyDataEntry) => void,
+): void {
+	for (let index = 0; index < encoded.count; index++) {
+		const numberOffset = index * 6;
+		const stringOffset = index * 3;
+		onEntry({
+			date: encoded.strings[stringOffset]!,
+			cost: encoded.numbers[numberOffset]!,
+			inputTokens: encoded.numbers[numberOffset + 1]!,
+			outputTokens: encoded.numbers[numberOffset + 2]!,
+			cacheCreationTokens: encoded.numbers[numberOffset + 3]!,
+			cacheReadTokens: encoded.numbers[numberOffset + 4]!,
+			model: encoded.strings[stringOffset + 1] ?? undefined,
+			project: encoded.project,
+			uniqueHash: encoded.strings[stringOffset + 2] ?? null,
+			tokenTotal: encoded.numbers[numberOffset + 5]!,
+			hasSpeed: encoded.flags[index] === 1,
+		});
+	}
+}
+
+/**
+ * Use the same columnar worker payload shape for session rows as daily rows.
+ *
+ * Each encoded session payload represents one JSONL file, so `sessionKey`, `sessionId`, and
+ * `projectPath` are file-level constants. Keeping those strings outside the per-row side array
+ * avoids repeatedly cloning identical metadata when workers return many rows from one session file.
+ */
+function encodeSessionDataEntries(entries: SessionDataEntry[]): EncodedSessionDataEntries {
+	const count = entries.length;
+	const numbers = new Float64Array(count * 6);
+	const flags = new Uint8Array(count);
+	const strings: Array<string | null> = [];
+	strings.length = count * 4;
+	const firstEntry = entries[0];
+
+	for (let index = 0; index < count; index++) {
+		const entry = entries[index]!;
+		const numberOffset = index * 6;
+		numbers[numberOffset] = entry.cost;
+		numbers[numberOffset + 1] = entry.inputTokens;
+		numbers[numberOffset + 2] = entry.outputTokens;
+		numbers[numberOffset + 3] = entry.cacheCreationTokens;
+		numbers[numberOffset + 4] = entry.cacheReadTokens;
+		numbers[numberOffset + 5] = entry.tokenTotal;
+		flags[index] = entry.hasSpeed ? 1 : 0;
+
+		const stringOffset = index * 4;
+		strings[stringOffset] = entry.timestamp;
+		strings[stringOffset + 1] = entry.model ?? null;
+		strings[stringOffset + 2] = entry.uniqueHash;
+		strings[stringOffset + 3] = entry.version ?? null;
+	}
+
+	return {
+		kind: 'session-columns',
+		count,
+		numbers,
+		flags,
+		sessionKey: firstEntry?.sessionKey ?? '',
+		sessionId: firstEntry?.sessionId ?? '',
+		projectPath: firstEntry?.projectPath ?? '',
+		strings,
+	};
+}
+
+function decodeSessionDataEntries(encoded: EncodedSessionDataEntries): SessionDataEntry[] {
+	const entries: SessionDataEntry[] = [];
+	forEachSessionDataEntry(encoded, (entry) => {
+		entries.push(entry);
+	});
+	return entries;
+}
+
+/**
+ * Reconstruct session rows lazily from columnar worker output.
+ *
+ * Session rows have more string fields than daily rows, but the same transfer-list trade-off applies:
+ * numbers and flags stay in typed arrays, and strings stay in a flat side array. Keeping the iterator
+ * as the hot-path API avoids a second decoded array when the caller only needs to merge each row once.
+ */
+function forEachSessionDataEntry(
+	encoded: EncodedSessionDataEntries,
+	onEntry: (entry: SessionDataEntry) => void,
+): void {
+	for (let index = 0; index < encoded.count; index++) {
+		const numberOffset = index * 6;
+		const stringOffset = index * 4;
+		onEntry({
+			sessionKey: encoded.sessionKey,
+			sessionId: encoded.sessionId,
+			projectPath: encoded.projectPath,
+			cost: encoded.numbers[numberOffset]!,
+			timestamp: encoded.strings[stringOffset]!,
+			model: encoded.strings[stringOffset + 1] ?? undefined,
+			inputTokens: encoded.numbers[numberOffset + 1]!,
+			outputTokens: encoded.numbers[numberOffset + 2]!,
+			cacheCreationTokens: encoded.numbers[numberOffset + 3]!,
+			cacheReadTokens: encoded.numbers[numberOffset + 4]!,
+			uniqueHash: encoded.strings[stringOffset + 2] ?? null,
+			tokenTotal: encoded.numbers[numberOffset + 5]!,
+			hasSpeed: encoded.flags[index] === 1,
+			version: (encoded.strings[stringOffset + 3] ?? undefined) as Version | undefined,
+		});
+	}
+}
+
+/**
+ * Pack block worker rows before crossing the worker boundary.
+ *
+ * Blocks need `Date` instances again on the main thread, but sending timestamps as numbers avoids
+ * cloning nested entry objects and lets the main thread reconstruct the small object graph once.
+ */
+function encodeBlockFileResult(result: BlockFileResult): EncodedBlockFileResult {
+	const count = result.entries.length;
+	const numbers = new Float64Array(count * 8);
+	const flags = new Uint8Array(count);
+	const strings: Array<string | null> = [];
+	strings.length = count * 3;
+
+	for (let index = 0; index < count; index++) {
+		const entry = result.entries[index]!;
+		const numberOffset = index * 8;
+		const timestampMs = entry.entry.timestampMs ?? entry.entry.timestamp.getTime();
+		numbers[numberOffset] = timestampMs;
+		numbers[numberOffset + 1] = entry.entry.costUSD ?? 0;
+		numbers[numberOffset + 2] = entry.entry.usage.inputTokens;
+		numbers[numberOffset + 3] = entry.entry.usage.outputTokens;
+		numbers[numberOffset + 4] = entry.entry.usage.cacheCreationInputTokens;
+		numbers[numberOffset + 5] = entry.entry.usage.cacheReadInputTokens;
+		numbers[numberOffset + 6] = entry.tokenTotal;
+		numbers[numberOffset + 7] = entry.entry.usageLimitResetTime?.getTime() ?? Number.NaN;
+		flags[index] = entry.hasSpeed ? 1 : 0;
+
+		const stringOffset = index * 3;
+		strings[stringOffset] = entry.entry.model;
+		strings[stringOffset + 1] = entry.uniqueHash;
+		strings[stringOffset + 2] = entry.entry.version ?? null;
+	}
+
+	return {
+		kind: 'block-columns',
+		file: result.file,
+		timestampMs: result.timestampMs,
+		count,
+		numbers,
+		flags,
+		strings,
+	};
+}
+
+function decodeBlockFileResult(encoded: EncodedBlockFileResult): BlockFileResult {
+	const entries: BlockEntryResult[] = [];
+	forEachBlockEntry(encoded, (entry) => {
+		entries.push(entry);
+	});
+
+	return {
+		file: encoded.file,
+		timestampMs: encoded.timestampMs,
+		entries,
+	};
+}
+
+/**
+ * Iterate encoded block worker rows without first rebuilding a nested result array.
+ *
+ * Blocks carry more per-row fields than daily/session results, so decoding every worker response
+ * into `{ entries: [...] }` allocates a second full copy before global dedupe immediately walks it.
+ * This iterator keeps the normal decoder available for tests/debugging, while the hot worker merge
+ * path can reconstruct one row at a time and discard duplicate rows before materializing anything
+ * beyond the final `allEntries` output.
+ */
+function forEachBlockEntry(
+	encoded: EncodedBlockFileResult,
+	onEntry: (entry: BlockEntryResult) => void,
+): void {
+	for (let index = 0; index < encoded.count; index++) {
+		const numberOffset = index * 8;
+		const stringOffset = index * 3;
+		const timestampMs = encoded.numbers[numberOffset]!;
+		const usageLimitResetTimeMs = encoded.numbers[numberOffset + 7]!;
+		onEntry({
+			entry: {
+				timestamp: new Date(timestampMs),
+				timestampMs,
+				usage: {
+					inputTokens: encoded.numbers[numberOffset + 2]!,
+					outputTokens: encoded.numbers[numberOffset + 3]!,
+					cacheCreationInputTokens: encoded.numbers[numberOffset + 4]!,
+					cacheReadInputTokens: encoded.numbers[numberOffset + 5]!,
+				},
+				costUSD: encoded.numbers[numberOffset + 1]!,
+				model: encoded.strings[stringOffset] ?? 'unknown',
+				version: encoded.strings[stringOffset + 2] ?? undefined,
+				usageLimitResetTime: Number.isNaN(usageLimitResetTimeMs)
+					? undefined
+					: new Date(usageLimitResetTimeMs),
+			},
+			uniqueHash: encoded.strings[stringOffset + 1] ?? null,
+			tokenTotal: encoded.numbers[numberOffset + 6]!,
+			hasSpeed: encoded.flags[index] === 1,
+		});
+	}
+}
+
+function getJSONLWorkerThreadCount(
+	fileCount: number,
+	singleThread = false,
+	preferMoreWorkers = false,
+): number {
+	if (
+		singleThread ||
+		fileCount < 64 ||
+		!isMainThread ||
+		import.meta.vitest != null ||
+		!import.meta.url.includes('/dist/')
+	) {
+		return 0;
+	}
+
+	const configured = Number.parseInt(process.env.CCUSAGE_JSONL_WORKER_THREADS ?? '', 10);
+	if (Number.isFinite(configured)) {
+		if (configured <= 0) {
+			return 0;
+		}
+		return Math.min(fileCount, configured);
+	}
+
+	return getDefaultJSONLWorkerThreadCount(fileCount, preferMoreWorkers);
+}
+
+function chunkIndexedItems<T>(
+	items: Array<IndexedWorkerItem<T>>,
+	chunkCount: number,
+): Array<Array<IndexedWorkerItem<T>>> {
+	const chunks: Array<Array<IndexedWorkerItem<T>>> = Array.from({ length: chunkCount }, () => []);
+	for (let index = 0; index < items.length; index++) {
+		chunks[index % chunkCount]!.push(items[index]!);
+	}
+	return chunks.filter((chunk) => chunk.length > 0);
+}
+
+async function chunkIndexedItemsByFileSize<T>(
+	items: Array<IndexedWorkerItem<T>>,
+	chunkCount: number,
+	getFilePath: (item: T) => string,
+): Promise<Array<Array<IndexedWorkerItem<T>>>> {
+	const weightedItems = await Promise.all(
+		items.map(async (item) => {
+			try {
+				return { item, weight: (await stat(getFilePath(item.item))).size };
+			} catch {
+				return { item, weight: 0 };
+			}
+		}),
+	);
+
+	weightedItems.sort((a, b) => b.weight - a.weight || a.item.index - b.item.index);
+
+	const chunks: Array<Array<IndexedWorkerItem<T>>> = Array.from({ length: chunkCount }, () => []);
+	const chunkWeights = Array.from<number>({ length: chunkCount }).fill(0);
+	for (const { item, weight } of weightedItems) {
+		let targetIndex = 0;
+		for (let index = 1; index < chunkWeights.length; index++) {
+			if (chunkWeights[index]! < chunkWeights[targetIndex]!) {
+				targetIndex = index;
+			}
+		}
+		chunks[targetIndex]!.push(item);
+		chunkWeights[targetIndex]! += weight;
+	}
+
+	return chunks.filter((chunk) => chunk.length > 0);
+}
+
+async function collectWithUsageWorkers<TItem, TResult>(
+	task: UsageWorkerTask,
+	items: TItem[],
+	options: {
+		mode: CostMode;
+		offline: boolean | undefined;
+		timezone: string | undefined;
+		singleThread: boolean | undefined;
+		getFilePath?: (item: TItem) => string;
+	},
+): Promise<TResult[] | null> {
+	const workerCount = getJSONLWorkerThreadCount(
+		items.length,
+		options.singleThread,
+		task === 'daily' || task === 'session',
+	);
+	if (workerCount === 0) {
+		return null;
+	}
+
+	const indexedItems = items.map<IndexedWorkerItem<TItem>>((item, index) => ({ index, item }));
+	const chunks =
+		options.getFilePath == null
+			? chunkIndexedItems(indexedItems, workerCount)
+			: await chunkIndexedItemsByFileSize(indexedItems, workerCount, options.getFilePath);
+	let pricing: Map<string, LiteLLMModelPricing> | undefined;
+	if (options.mode !== 'display' && options.offline !== true) {
+		using fetcher = new PricingFetcher(options.offline);
+		pricing = Result.unwrap(
+			await fetcher.fetchModelPricing(),
+			new Map<string, LiteLLMModelPricing>(),
+		);
+	}
+	const workerResults: Array<Promise<Array<{ index: number; result: TResult }>>> = [];
+	for (const chunk of chunks) {
+		workerResults.push(
+			new Promise<Array<{ index: number; result: TResult }>>((resolve, reject) => {
+				const worker = new Worker(new URL(import.meta.url), {
+					workerData: {
+						kind: 'ccusage:usage-worker',
+						task,
+						items: chunk,
+						mode: options.mode,
+						offline: options.offline,
+						timezone: options.timezone,
+						pricing,
+					} satisfies UsageWorkerData,
+				});
+				worker.once('message', (message: UsageWorkerResponse<TResult>) => {
+					resolve(message.results);
+				});
+				worker.once('error', reject);
+				worker.once('exit', (code) => {
+					if (code !== 0) {
+						reject(new Error(`ccusage worker exited with code ${code}`));
+					}
+				});
+			}),
+		);
+	}
+	const resultGroups = await Promise.all(workerResults);
+	const orderedResults = createResultSlots<TResult>(items.length);
+	for (const results of resultGroups) {
+		for (const { index, result } of results) {
+			orderedResults[index] = result;
+		}
+	}
+
+	return orderedResults;
+}
+
+async function collectDailyEntriesFromFile(
+	file: string,
+	calculateCost: CostCalculator,
+	formatUsageDate: (dateStr: string) => string,
+): Promise<DailyDataEntry[]> {
+	const project = extractProjectFromPath(file);
+	const entries: DailyDataEntry[] = [];
+	const processedEntries = createDedupedEntryIndex();
+
+	await processJSONLUsageFileByLine(file, (line, usageMarkerIndex) => {
+		try {
+			const data = parseUsageDataLine(line, { usageMarkerIndex });
+			if (data == null) {
+				return;
+			}
+
+			const date = formatUsageDate(data.timestamp);
+			const uniqueHash = createUniqueHash(data);
+			const usage = data.message.usage;
+			const tokenTotal = sumUsageTokens(usage);
+			const hasSpeed = usage.speed != null;
+			let existingEntryIndex: number | undefined;
+			if (uniqueHash != null) {
+				existingEntryIndex = processedEntries[uniqueHash];
+				if (
+					existingEntryIndex != null &&
+					!shouldReplaceEntryMetadata({ tokenTotal, hasSpeed }, entries[existingEntryIndex]!)
+				) {
+					return;
+				}
+			}
+
+			const model = data.message.model;
+			const entry = {
+				date,
+				cost: calculateCost(data),
+				inputTokens: usage.input_tokens,
+				outputTokens: usage.output_tokens,
+				cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+				cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+				model: formatUsageModelName(model, usage.speed),
+				project,
+				uniqueHash,
+				tokenTotal,
+				hasSpeed,
+			};
+			if (existingEntryIndex != null) {
+				entries[existingEntryIndex] = entry;
+			} else {
+				entries.push(entry);
+				markDedupedEntryMetadata(processedEntries, entry, entries.length - 1);
+			}
+		} catch {
+			// Skip invalid JSON lines
+		}
+	});
+
+	return entries;
+}
+
+async function collectSessionEntriesFromFile(
+	item: GlobResult,
+	mode: CostMode,
+	calculateCost: CostCalculator,
+): Promise<SessionDataEntry[]> {
+	const { file, baseDir } = item;
+	const relativePath = path.relative(baseDir, file);
+	const parts = relativePath.split(path.sep);
+	const sessionId = parts[parts.length - 2] ?? 'unknown';
+	const joinedPath = parts.slice(0, -2).join(path.sep);
+	const projectPath = joinedPath.length > 0 ? joinedPath : 'Unknown Project';
+	const entries: SessionDataEntry[] = [];
+	const processedEntries = createDedupedEntryIndex();
+
+	await processJSONLUsageFileByLine(file, (line, usageMarkerIndex) => {
+		try {
+			const data = parseUsageDataLine(line, { usageMarkerIndex });
+			if (data == null) {
+				return;
+			}
+
+			const immediateCost = getImmediateCostForEntry(data, mode);
+			const uniqueHash = createUniqueHash(data);
+			const usage = data.message.usage;
+			const tokenTotal = sumUsageTokens(usage);
+			const hasSpeed = usage.speed != null;
+			let existingEntryIndex: number | undefined;
+			if (uniqueHash != null) {
+				existingEntryIndex = processedEntries[uniqueHash];
+				if (
+					existingEntryIndex != null &&
+					!shouldReplaceEntryMetadata({ tokenTotal, hasSpeed }, entries[existingEntryIndex]!)
+				) {
+					return;
+				}
+			}
+
+			const model = data.message.model;
+			const entry = {
+				sessionKey: `${projectPath}/${sessionId}`,
+				sessionId,
+				projectPath,
+				cost: immediateCost ?? calculateCost(data),
+				timestamp: data.timestamp,
+				model: formatUsageModelName(model, usage.speed),
+				inputTokens: usage.input_tokens,
+				outputTokens: usage.output_tokens,
+				cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+				cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+				version: data.version,
+				uniqueHash,
+				tokenTotal,
+				hasSpeed,
+			};
+			if (existingEntryIndex != null) {
+				entries[existingEntryIndex] = entry;
+			} else {
+				entries.push(entry);
+				markDedupedEntryMetadata(processedEntries, entry, entries.length - 1);
+			}
+		} catch {
+			// Skip invalid JSON lines
+		}
+	});
+
+	return entries;
+}
+
+async function collectBlockFileResult(
+	file: string,
+	calculateCost: CostCalculator,
+): Promise<BlockFileResult> {
+	let timestampMs: number | null = null;
+	const entries: BlockEntryResult[] = [];
+	const processedEntries = createDedupedEntryIndex();
+
+	const setEarliestTimestamp = (lineTimestamp: Date, lineTimestampMs: number): void => {
+		if (!Number.isNaN(lineTimestampMs) && (timestampMs == null || lineTimestampMs < timestampMs)) {
+			timestampMs = lineTimestampMs;
+		}
+	};
+
+	const processLine = (line: string, usageMarkerIndex: number): void => {
+		try {
+			const data = parseUsageDataLine(line, { usageMarkerIndex });
+			if (data == null) {
+				return;
+			}
+			const parsedTimestampMs = parseIsoTimestampMs(data.timestamp);
+			const lineTimestamp = Number.isNaN(parsedTimestampMs)
+				? new Date(data.timestamp)
+				: new Date(parsedTimestampMs);
+			setEarliestTimestamp(
+				lineTimestamp,
+				Number.isNaN(parsedTimestampMs) ? lineTimestamp.getTime() : parsedTimestampMs,
+			);
+
+			const uniqueHash = createUniqueHash(data);
+			const usage = data.message.usage;
+			const tokenTotal = sumUsageTokens(usage);
+			const hasSpeed = usage.speed != null;
+			let existingEntryIndex: number | undefined;
+			if (uniqueHash != null) {
+				existingEntryIndex = processedEntries[uniqueHash];
+				if (
+					existingEntryIndex != null &&
+					!shouldReplaceEntryMetadata({ tokenTotal, hasSpeed }, entries[existingEntryIndex]!)
+				) {
+					return;
+				}
+			}
+
+			const usageLimitResetTime = getUsageLimitResetTime(data);
+			const model = data.message.model;
+			const entry: BlockEntryResult = {
+				entry: {
+					timestamp: lineTimestamp,
+					timestampMs: Number.isNaN(parsedTimestampMs)
+						? lineTimestamp.getTime()
+						: parsedTimestampMs,
+					usage: {
+						inputTokens: usage.input_tokens,
+						outputTokens: usage.output_tokens,
+						cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
+						cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
+					},
+					costUSD: calculateCost(data),
+					model: formatUsageModelNameOrUnknown(model, usage.speed),
+					version: data.version,
+					usageLimitResetTime: usageLimitResetTime ?? undefined,
+				},
+				uniqueHash,
+				tokenTotal,
+				hasSpeed,
+			};
+			if (existingEntryIndex != null) {
+				entries[existingEntryIndex] = entry;
+			} else {
+				entries.push(entry);
+				markDedupedEntryMetadata(processedEntries, entry, entries.length - 1);
+			}
+		} catch (error) {
+			logger.debug(
+				`Skipping invalid JSON line in 5-hour blocks: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	};
+
+	await processJSONLUsageFileByLine(file, processLine);
+
+	return {
+		file,
+		timestampMs,
+		entries,
+	};
+}
 
 /**
  * Loads and aggregates Claude usage data by day
@@ -775,114 +2535,102 @@ export async function loadDailyUsageData(options?: LoadOptions): Promise<DailyUs
 		(filePath) => extractProjectFromPath(filePath),
 		options?.project,
 	);
-
-	// Sort files by timestamp to ensure chronological processing
-	const sortedFiles = await sortFilesByTimestamp(projectFilteredFiles);
+	const mtimeFilteredFiles = await filterFilesByMtime(
+		projectFilteredFiles,
+		(filePath) => filePath,
+		options?.since,
+		options?.minUpdateTime,
+	);
 
 	// Fetch pricing data for cost calculation only when needed
 	const mode = options?.mode ?? 'auto';
 
-	// Use PricingFetcher with using statement for automatic cleanup
-	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
+	const formatUsageDate = createCachedDateFormatter(options?.timezone);
 
-	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
-
-	// Collect all valid data entries first
-	const allEntries: {
-		data: UsageData;
-		date: string;
-		cost: number;
-		model: string | undefined;
-		project: string;
-	}[] = [];
-
-	for (const file of sortedFiles) {
-		// Extract project name from file path once per file
-		const project = extractProjectFromPath(file);
-
-		await processJSONLFileByLine(file, async (line) => {
-			try {
-				const parsed = JSON.parse(line) as unknown;
-				const result = v.safeParse(usageDataSchema, parsed);
-				if (!result.success) {
+	const allEntries: DailyDataEntry[] = [];
+	// The merge loop writes stable indexes for dedupe replacement, so a local length counter keeps
+	// appends explicit without asking Array#push to update and return the length on every usage row.
+	let allEntriesLength = 0;
+	const processedEntries = createDedupedEntryIndex();
+	const mergeEntry = (entry: DailyDataEntry): void => {
+		if (entry.uniqueHash != null) {
+			const existingEntryIndex = processedEntries[entry.uniqueHash];
+			if (existingEntryIndex != null) {
+				if (!shouldReplaceEntryMetadata(entry, allEntries[existingEntryIndex]!)) {
 					return;
 				}
-				const data = result.output;
-
-				// Check for duplicate message + request ID combination
-				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-					// Skip duplicate message
-					return;
-				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
-
-				const date = formatDate(data.timestamp, options?.timezone);
-				// If fetcher is available, calculate cost based on mode and tokens
-				// If fetcher is null, use pre-calculated costUSD or default to 0
-				const cost =
-					fetcher != null ? await calculateCostForEntry(data, mode, fetcher) : (data.costUSD ?? 0);
-
-				allEntries.push({ data, date, cost, model: getDisplayModelName(data), project });
-			} catch {
-				// Skip invalid JSON lines
+				allEntries[existingEntryIndex] = entry;
+				return;
 			}
-		});
+
+			processedEntries[entry.uniqueHash] = allEntriesLength;
+		}
+
+		allEntries[allEntriesLength++] = entry;
+	};
+
+	const workerFileResults = await collectWithUsageWorkers<string, EncodedDailyDataEntries>(
+		'daily',
+		mtimeFilteredFiles,
+		{
+			mode,
+			offline: options?.offline,
+			timezone: options?.timezone,
+			singleThread: options?.singleThread,
+			getFilePath: (file) => file,
+		},
+	);
+	if (workerFileResults == null) {
+		using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
+		const calculateCost = await createCostCalculator(mode, fetcher);
+		const fallbackFileResults = await mapWithConcurrency(
+			mtimeFilteredFiles,
+			getJSONLFileReadConcurrency(mtimeFilteredFiles.length, options?.singleThread),
+			async (file): Promise<DailyDataEntry[]> =>
+				collectDailyEntriesFromFile(file, calculateCost, formatUsageDate),
+		);
+		for (const entries of fallbackFileResults) {
+			for (const entry of entries) {
+				mergeEntry(entry);
+			}
+		}
+	} else {
+		for (const encodedEntries of workerFileResults) {
+			forEachDailyDataEntry(encodedEntries, mergeEntry);
+		}
 	}
 
 	// Group by date, optionally including project
 	// Automatically enable project grouping when project filter is specified
 	const needsProjectGrouping = options?.groupByProject === true || options?.project != null;
-	const groupingKey = needsProjectGrouping
-		? (entry: (typeof allEntries)[0]) => `${entry.date}\x00${entry.project}`
-		: (entry: (typeof allEntries)[0]) => entry.date;
+	const groupedData = new Map<
+		string,
+		{
+			date: string;
+			project: string | undefined;
+			summary: UsageSummaryAccumulator;
+		}
+	>();
 
-	const groupedData = Object.groupBy(allEntries, groupingKey);
-
-	// Aggregate each group
-	const results = Object.entries(groupedData)
-		.map(([groupKey, entries]) => {
-			if (entries == null) {
-				return undefined;
-			}
-
-			// Extract date and project from groupKey (format: "date" or "date\x00project")
-			const parts = groupKey.split('\x00');
-			const date = parts[0] ?? groupKey;
-			const project = parts.length > 1 ? parts[1] : undefined;
-
-			// Aggregate by model first
-			const modelAggregates = aggregateByModel(
-				entries,
-				(entry) => entry.model,
-				(entry) => entry.data.message.usage,
-				(entry) => entry.cost,
-			);
-
-			// Create model breakdowns
-			const modelBreakdowns = createModelBreakdowns(modelAggregates);
-
-			// Calculate totals
-			const totals = calculateTotals(
-				entries,
-				(entry) => entry.data.message.usage,
-				(entry) => entry.cost,
-			);
-
-			const modelsUsed = extractUniqueModels(entries, (e) => e.model);
-
-			return {
-				date: createDailyDate(date),
-				...totals,
-				modelsUsed: modelsUsed as ModelName[],
-				modelBreakdowns,
-				...(project != null && { project }),
+	for (const entry of allEntries) {
+		const groupKey = needsProjectGrouping ? `${entry.date}\x00${entry.project}` : entry.date;
+		let group = groupedData.get(groupKey);
+		if (group == null) {
+			group = {
+				date: entry.date,
+				project: needsProjectGrouping ? entry.project : undefined,
+				summary: createUsageSummaryAccumulator(),
 			};
-		})
-		.filter((item) => item != null);
+			groupedData.set(groupKey, group);
+		}
+		addTokenFieldsToSummaryAccumulator(group.summary, entry.model, entry, entry.cost);
+	}
+
+	const results = Array.from(groupedData.values(), (group) => ({
+		date: group.date as DailyDate,
+		...finalizeUsageSummary(group.summary),
+		...(group.project != null && { project: group.project }),
+	}));
 
 	// Filter by date range if specified
 	const dateFiltered = filterByDateRange(
@@ -922,142 +2670,106 @@ export async function loadSessionData(options?: LoadOptions): Promise<SessionUsa
 		(item) => extractProjectFromPath(item.file),
 		options?.project,
 	);
-
-	// Sort files by timestamp to ensure chronological processing
-	// Create a map for O(1) lookup instead of O(N) find operations
-	const fileToBaseMap = new Map(projectFilteredWithBase.map((f) => [f.file, f.baseDir]));
-	const sortedFilesWithBase = await sortFilesByTimestamp(
-		projectFilteredWithBase.map((f) => f.file),
-	).then((sortedFiles) =>
-		sortedFiles.map((file) => ({
-			file,
-			baseDir: fileToBaseMap.get(file) ?? '',
-		})),
+	const mtimeFilteredWithBase = await filterFilesByMtime(
+		projectFilteredWithBase,
+		(item) => item.file,
+		options?.since,
+		options?.minUpdateTime,
 	);
 
 	// Fetch pricing data for cost calculation only when needed
 	const mode = options?.mode ?? 'auto';
 
-	// Use PricingFetcher with using statement for automatic cleanup
-	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
-
-	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
+	const formatUsageDate = createCachedDateFormatter(options?.timezone);
 
 	// Collect all valid data entries with session info first
-	const allEntries: Array<{
-		data: UsageData;
-		sessionKey: string;
-		sessionId: string;
-		projectPath: string;
-		cost: number;
-		timestamp: string;
-		model: string | undefined;
-	}> = [];
-
-	for (const { file, baseDir } of sortedFilesWithBase) {
-		// Extract session info from file path using its specific base directory
-		const relativePath = path.relative(baseDir, file);
-		const parts = relativePath.split(path.sep);
-
-		// Session ID is the directory name containing the JSONL file
-		const sessionId = parts[parts.length - 2] ?? 'unknown';
-		// Project path is everything before the session ID
-		const joinedPath = parts.slice(0, -2).join(path.sep);
-		const projectPath = joinedPath.length > 0 ? joinedPath : 'Unknown Project';
-
-		await processJSONLFileByLine(file, async (line) => {
-			try {
-				const parsed = JSON.parse(line) as unknown;
-				const result = v.safeParse(usageDataSchema, parsed);
-				if (!result.success) {
+	const allEntries: SessionDataEntry[] = [];
+	// Keep the append index stable for dedupe replacement while avoiding Array#push in this hot loop.
+	let allEntriesLength = 0;
+	const processedEntries = createDedupedEntryIndex();
+	const mergeEntry = (entry: SessionDataEntry): void => {
+		if (entry.uniqueHash != null) {
+			const existingEntryIndex = processedEntries[entry.uniqueHash];
+			if (existingEntryIndex != null) {
+				if (!shouldReplaceEntryMetadata(entry, allEntries[existingEntryIndex]!)) {
 					return;
 				}
-				const data = result.output;
-
-				// Check for duplicate message + request ID combination
-				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-					// Skip duplicate message
-					return;
-				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
-
-				const sessionKey = `${projectPath}/${sessionId}`;
-				const cost =
-					fetcher != null ? await calculateCostForEntry(data, mode, fetcher) : (data.costUSD ?? 0);
-
-				allEntries.push({
-					data,
-					sessionKey,
-					sessionId,
-					projectPath,
-					cost,
-					timestamp: data.timestamp,
-					model: getDisplayModelName(data),
-				});
-			} catch {
-				// Skip invalid JSON lines
+				allEntries[existingEntryIndex] = entry;
+				return;
 			}
-		});
+
+			processedEntries[entry.uniqueHash] = allEntriesLength;
+		}
+
+		allEntries[allEntriesLength++] = entry;
+	};
+
+	const workerFileResults = await collectWithUsageWorkers<GlobResult, EncodedSessionDataEntries>(
+		'session',
+		mtimeFilteredWithBase,
+		{
+			mode,
+			offline: options?.offline,
+			timezone: options?.timezone,
+			singleThread: options?.singleThread,
+			getFilePath: (item) => item.file,
+		},
+	);
+	if (workerFileResults == null) {
+		using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
+		const calculateCost = await createCostCalculator(mode, fetcher);
+		const fallbackFileResults = await mapWithConcurrency(
+			mtimeFilteredWithBase,
+			getJSONLFileReadConcurrency(mtimeFilteredWithBase.length, options?.singleThread),
+			async (item): Promise<SessionDataEntry[]> =>
+				collectSessionEntriesFromFile(item, mode, calculateCost),
+		);
+		for (const entries of fallbackFileResults) {
+			for (const entry of entries) {
+				mergeEntry(entry);
+			}
+		}
+	} else {
+		for (const encodedEntries of workerFileResults) {
+			forEachSessionDataEntry(encodedEntries, mergeEntry);
+		}
 	}
 
-	// Group by session using Object.groupBy
-	const groupedBySessions = Object.groupBy(allEntries, (entry) => entry.sessionKey);
+	const groupedBySessions = new Map<
+		string,
+		{
+			latestEntry: SessionDataEntry;
+			summary: UsageSummaryAccumulator;
+			versions: Set<string>;
+		}
+	>();
 
-	// Aggregate each session group
-	const results = Object.entries(groupedBySessions)
-		.map(([_, entries]) => {
-			if (entries == null) {
-				return undefined;
-			}
-
-			// Find the latest timestamp for lastActivity
-			const latestEntry = entries.reduce((latest, current) =>
-				current.timestamp > latest.timestamp ? current : latest,
-			);
-
-			// Collect all unique versions
-			const versions: string[] = [];
-			for (const entry of entries) {
-				if (entry.data.version != null) {
-					versions.push(entry.data.version);
-				}
-			}
-
-			// Aggregate by model
-			const modelAggregates = aggregateByModel(
-				entries,
-				(entry) => entry.model,
-				(entry) => entry.data.message.usage,
-				(entry) => entry.cost,
-			);
-
-			// Create model breakdowns
-			const modelBreakdowns = createModelBreakdowns(modelAggregates);
-
-			// Calculate totals
-			const totals = calculateTotals(
-				entries,
-				(entry) => entry.data.message.usage,
-				(entry) => entry.cost,
-			);
-
-			const modelsUsed = extractUniqueModels(entries, (e) => e.model);
-
-			return {
-				sessionId: createSessionId(latestEntry.sessionId),
-				projectPath: createProjectPath(latestEntry.projectPath),
-				...totals,
-				lastActivity: formatDate(latestEntry.timestamp, options?.timezone) as ActivityDate,
-				versions: Array.from(new Set(versions)).sort() as Version[],
-				modelsUsed: modelsUsed as ModelName[],
-				modelBreakdowns,
+	for (const entry of allEntries) {
+		let group = groupedBySessions.get(entry.sessionKey);
+		if (group == null) {
+			group = {
+				latestEntry: entry,
+				summary: createUsageSummaryAccumulator(),
+				versions: new Set<string>(),
 			};
-		})
-		.filter((item) => item != null);
+			groupedBySessions.set(entry.sessionKey, group);
+		} else if (entry.timestamp > group.latestEntry.timestamp) {
+			group.latestEntry = entry;
+		}
+
+		if (entry.version != null) {
+			group.versions.add(entry.version);
+		}
+		addTokenFieldsToSummaryAccumulator(group.summary, entry.model, entry, entry.cost);
+	}
+
+	const results = Array.from(groupedBySessions.values(), (group) => ({
+		sessionId: createSessionId(group.latestEntry.sessionId),
+		projectPath: group.latestEntry.projectPath as ProjectPath,
+		...finalizeUsageSummary(group.summary),
+		lastActivity: formatUsageDate(group.latestEntry.timestamp) as ActivityDate,
+		versions: Array.from(group.versions).sort() as Version[],
+	}));
 
 	// Filter by date range if specified
 	const dateFiltered = filterByDateRange(
@@ -1075,13 +2787,12 @@ export async function loadSessionData(options?: LoadOptions): Promise<SessionUsa
 	);
 
 	// Sort sessions by cost (highest first by default), as documented
-	const sorted = sort(sessionFiltered);
 	const order = options?.order ?? 'desc';
 	switch (order) {
 		case 'asc':
-			return sorted.asc((item) => item.totalCost);
+			return sessionFiltered.toSorted((a, b) => a.totalCost - b.totalCost);
 		case 'desc':
-			return sorted.desc((item) => item.totalCost);
+			return sessionFiltered.toSorted((a, b) => b.totalCost - a.totalCost);
 		default:
 			unreachable(order);
 	}
@@ -1095,11 +2806,11 @@ export async function loadSessionData(options?: LoadOptions): Promise<SessionUsa
  */
 export async function loadMonthlyUsageData(options?: LoadOptions): Promise<MonthlyUsage[]> {
 	return loadBucketUsageData(
-		(data: DailyUsage) => createMonthlyDate(data.date.slice(0, 7)),
+		(data: DailyUsage) => data.date.slice(0, 7) as MonthlyDate,
 		options,
 	).then((usages) =>
 		usages.map<MonthlyUsage>(({ bucket, ...rest }) => ({
-			month: v.parse(monthlyDateSchema, bucket),
+			month: bucket as MonthlyDate,
 			...rest,
 		})),
 	);
@@ -1110,11 +2821,11 @@ export async function loadWeeklyUsageData(options?: LoadOptions): Promise<Weekly
 		options?.startOfWeek != null ? getDayNumber(options.startOfWeek) : getDayNumber('sunday');
 
 	return loadBucketUsageData(
-		(data: DailyUsage) => getDateWeek(new Date(data.date), startDay),
+		(data: DailyUsage) => getDateStringWeek(data.date, startDay),
 		options,
 	).then((usages) =>
 		usages.map<WeeklyUsage>(({ bucket, ...rest }) => ({
-			week: v.parse(weeklyDateSchema, bucket),
+			week: bucket as WeeklyDate,
 			...rest,
 		})),
 	);
@@ -1135,49 +2846,48 @@ export async function loadSessionUsageById(
 ): Promise<{ totalCost: number; entries: UsageData[] } | null> {
 	const claudePaths = getClaudePaths();
 
-	// Find the JSONL file for this session ID
-	// On Windows, replace backslashes from path.join with forward slashes for tinyglobby compatibility
-	const patterns = claudePaths.map((p) =>
-		path.join(p, 'projects', '**', `${sessionId}.jsonl`).replace(/\\/g, '/'),
-	);
-	// Absolute paths important on Windows - relative paths will break if session file is on different disk.
-	const jsonlFiles = await glob(patterns, { absolute: true });
-
-	if (jsonlFiles.length === 0) {
-		return null;
+	const targetFile = `${sessionId}.jsonl`;
+	let file: string | undefined;
+	for (const claudePath of claudePaths) {
+		const claudeDir = path.join(claudePath, CLAUDE_PROJECTS_DIR_NAME);
+		file = (await collectJsonlFiles(claudeDir)).find(
+			(candidate) => path.basename(candidate) === targetFile,
+		);
+		if (file != null) {
+			break;
+		}
 	}
-
-	const file = jsonlFiles[0];
 	if (file == null) {
 		return null;
 	}
 
 	const mode = options?.mode ?? 'auto';
 	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
+	const calculateCost = await createCostCalculator(mode, fetcher);
 
-	const entries: UsageData[] = [];
+	const entries: Array<UsageData | undefined> = [];
 	let totalCost = 0;
 
-	await processJSONLFileByLine(file, async (line) => {
+	await processJSONLFileByLine(file, (line) => {
 		try {
-			const parsed = JSON.parse(line) as unknown;
-			const result = v.safeParse(usageDataSchema, parsed);
-			if (!result.success) {
+			if (!line.includes(USAGE_LINE_MARKER)) {
 				return;
 			}
-			const data = result.output;
 
-			const cost =
-				fetcher != null ? await calculateCostForEntry(data, mode, fetcher) : (data.costUSD ?? 0);
+			const data = parseUsageDataLine(line);
+			if (data == null) {
+				return;
+			}
 
-			totalCost += cost;
+			const immediateCost = getImmediateCostForEntry(data, mode);
+			totalCost += immediateCost ?? calculateCost(data);
 			entries.push(data);
 		} catch {
 			// Skip invalid JSON lines
 		}
 	});
 
-	return { totalCost, entries };
+	return { totalCost, entries: entries.filter((entry): entry is UsageData => entry != null) };
 }
 
 export async function loadBucketUsageData(
@@ -1190,72 +2900,73 @@ export async function loadBucketUsageData(
 	// Automatically enable project grouping when project filter is specified
 	const needsProjectGrouping = options?.groupByProject === true || options?.project != null;
 
-	const groupingKey = needsProjectGrouping
-		? (data: DailyUsage) => {
-				const bucketValue = groupingFn(data);
-				const projectSegment = data.project ?? 'unknown';
-				return `${bucketValue}\x00${projectSegment}`;
-			}
-		: (data: DailyUsage) => `${groupingFn(data)}`;
+	const grouped = new Map<
+		string,
+		{
+			bucket: Bucket;
+			project: string | undefined;
+			summary: UsageSummaryAccumulator;
+		}
+	>();
 
-	const grouped = Object.groupBy(dailyData, groupingKey);
-
-	const buckets: BucketUsage[] = [];
-	for (const [groupKey, dailyEntries] of Object.entries(grouped)) {
-		if (dailyEntries == null) {
-			continue;
+	for (const daily of dailyData) {
+		const bucket = groupingFn(daily);
+		const project = needsProjectGrouping ? (daily.project ?? 'unknown') : undefined;
+		const groupKey = project == null ? bucket : `${bucket}\x00${project}`;
+		let group = grouped.get(groupKey);
+		if (group == null) {
+			group = {
+				bucket,
+				project,
+				summary: createUsageSummaryAccumulator(),
+			};
+			grouped.set(groupKey, group);
 		}
 
-		const parts = groupKey.split('\x00');
-		const bucket = createBucket(parts[0] ?? groupKey);
-		const project = parts.length > 1 ? parts[1] : undefined;
+		group.summary.totals.inputTokens += daily.inputTokens;
+		group.summary.totals.outputTokens += daily.outputTokens;
+		group.summary.totals.cacheCreationTokens += daily.cacheCreationTokens;
+		group.summary.totals.cacheReadTokens += daily.cacheReadTokens;
+		group.summary.totals.cost += daily.totalCost;
+		group.summary.totals.totalCost += daily.totalCost;
 
-		// Aggregate model breakdowns across all days
-		const allBreakdowns = dailyEntries.flatMap((daily) => daily.modelBreakdowns);
-		const modelAggregates = aggregateModelBreakdowns(allBreakdowns);
-
-		// Create model breakdowns
-		const modelBreakdowns = createModelBreakdowns(modelAggregates);
-
-		// Collect unique models
-		const models: string[] = [];
-		for (const data of dailyEntries) {
-			for (const model of data.modelsUsed) {
-				// Skip synthetic model
-				if (model !== '<synthetic>') {
-					models.push(model);
-				}
+		for (const model of daily.modelsUsed) {
+			if (model !== '<synthetic>') {
+				addModelUsed(group.summary, model);
 			}
 		}
 
-		// Calculate totals from daily entries
-		let totalInputTokens = 0;
-		let totalOutputTokens = 0;
-		let totalCacheCreationTokens = 0;
-		let totalCacheReadTokens = 0;
-		let totalCost = 0;
-
-		for (const daily of dailyEntries) {
-			totalInputTokens += daily.inputTokens;
-			totalOutputTokens += daily.outputTokens;
-			totalCacheCreationTokens += daily.cacheCreationTokens;
-			totalCacheReadTokens += daily.cacheReadTokens;
-			totalCost += daily.totalCost;
+		for (const breakdown of daily.modelBreakdowns) {
+			if (breakdown.modelName === '<synthetic>') {
+				continue;
+			}
+			let aggregate = group.summary.modelAggregates[breakdown.modelName];
+			if (aggregate == null) {
+				aggregate = createEmptyTokenStats();
+				group.summary.modelAggregates[breakdown.modelName] = aggregate;
+			}
+			aggregate.inputTokens += breakdown.inputTokens;
+			aggregate.outputTokens += breakdown.outputTokens;
+			aggregate.cacheCreationTokens += breakdown.cacheCreationTokens;
+			aggregate.cacheReadTokens += breakdown.cacheReadTokens;
+			aggregate.cost += breakdown.cost;
 		}
-		const bucketUsage: BucketUsage = {
-			bucket,
-			inputTokens: totalInputTokens,
-			outputTokens: totalOutputTokens,
-			cacheCreationTokens: totalCacheCreationTokens,
-			cacheReadTokens: totalCacheReadTokens,
-			totalCost,
-			modelsUsed: Array.from(new Set(models)) as ModelName[],
-			modelBreakdowns,
-			...(project != null && { project }),
-		};
-
-		buckets.push(bucketUsage);
 	}
+
+	const buckets = Array.from(grouped.values(), (group): BucketUsage => {
+		const summary = finalizeUsageSummary(group.summary);
+		return {
+			bucket: createBucket(group.bucket),
+			inputTokens: summary.inputTokens,
+			outputTokens: summary.outputTokens,
+			cacheCreationTokens: summary.cacheCreationTokens,
+			cacheReadTokens: summary.cacheReadTokens,
+			totalCost: summary.totalCost,
+			modelsUsed: summary.modelsUsed,
+			modelBreakdowns: summary.modelBreakdowns,
+			...(group.project != null && { project: group.project }),
+		};
+	});
 
 	return sortByDate(buckets, (item) => item.bucket, options?.order);
 }
@@ -1352,6 +3063,30 @@ export async function calculateContextTokens(
 }
 
 /**
+ * Keep block file ordering identical across decoded and encoded worker results.
+ *
+ * Worker results are produced by balanced chunks, not by file order. Sorting by the earliest usage
+ * timestamp before global dedupe preserves the same replacement behavior as the non-worker path;
+ * the file path tie-breaker keeps the ordering deterministic for logs with identical timestamps.
+ */
+function compareBlockFileResults(
+	a: { file: string; timestampMs: number | null },
+	b: { file: string; timestampMs: number | null },
+): number {
+	if (a.timestampMs == null && b.timestampMs == null) {
+		return compareStrings(a.file, b.file);
+	}
+	if (a.timestampMs == null) {
+		return 1;
+	}
+	if (b.timestampMs == null) {
+		return -1;
+	}
+	const timestampDiff = a.timestampMs - b.timestampMs;
+	return timestampDiff === 0 ? compareStrings(a.file, b.file) : timestampDiff;
+}
+
+/**
  * Loads usage data and organizes it into session blocks (typically 5-hour billing periods)
  * Processes all usage data and groups it into time-based blocks for billing analysis
  * @param options - Optional configuration including session duration and filtering
@@ -1362,15 +3097,7 @@ export async function loadSessionBlockData(options?: LoadOptions): Promise<Sessi
 	const claudePaths = toArray(options?.claudePath ?? getClaudePaths());
 
 	// Collect files from all paths
-	const allFiles: string[] = [];
-	for (const claudePath of claudePaths) {
-		const claudeDir = path.join(claudePath, CLAUDE_PROJECTS_DIR_NAME);
-		const files = await glob([USAGE_DATA_GLOB_PATTERN], {
-			cwd: claudeDir,
-			absolute: true,
-		});
-		allFiles.push(...files);
-	}
+	const allFiles = (await globUsageFiles(claudePaths)).map((item) => item.file);
 
 	if (allFiles.length === 0) {
 		return [];
@@ -1382,68 +3109,72 @@ export async function loadSessionBlockData(options?: LoadOptions): Promise<Sessi
 		(filePath) => extractProjectFromPath(filePath),
 		options?.project,
 	);
-
-	// Sort files by timestamp to ensure chronological processing
-	const sortedFiles = await sortFilesByTimestamp(blocksFilteredFiles);
+	const mtimeFilteredFiles = await filterFilesByMtime(
+		blocksFilteredFiles,
+		(filePath) => filePath,
+		options?.since,
+		options?.minUpdateTime,
+	);
 
 	// Fetch pricing data for cost calculation only when needed
 	const mode = options?.mode ?? 'auto';
 
-	// Use PricingFetcher with using statement for automatic cleanup
-	using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
-
-	// Track processed message+request combinations for deduplication
-	const processedHashes = new Set<string>();
+	const formatUsageDate = createCachedDateFormatter(options?.timezone);
 
 	// Collect all valid data entries first
 	const allEntries: LoadedUsageEntry[] = [];
+	// Blocks keep replacement indexes in processedEntries, so the explicit length is the canonical
+	// append position for both unique and non-hashed rows.
+	let allEntriesLength = 0;
+	const processedEntries = createDedupedBlockEntryIndex();
+	const mergeBlockEntry = ({ entry, uniqueHash, tokenTotal, hasSpeed }: BlockEntryResult): void => {
+		if (uniqueHash == null) {
+			allEntries[allEntriesLength++] = entry;
+			return;
+		}
 
-	for (const file of sortedFiles) {
-		await processJSONLFileByLine(file, async (line) => {
-			try {
-				const parsed = JSON.parse(line) as unknown;
-				const result = v.safeParse(usageDataSchema, parsed);
-				if (!result.success) {
-					return;
-				}
-				const data = result.output;
+		const existing = processedEntries[uniqueHash];
+		if (existing == null) {
+			const index = allEntriesLength++;
+			allEntries[index] = entry;
+			processedEntries[uniqueHash] = { tokenTotal, hasSpeed, index };
+			return;
+		}
+		if (shouldReplaceEntryMetadata({ tokenTotal, hasSpeed }, existing)) {
+			allEntries[existing.index] = entry;
+			processedEntries[uniqueHash] = { tokenTotal, hasSpeed, index: existing.index };
+		}
+	};
 
-				// Check for duplicate message + request ID combination
-				const uniqueHash = createUniqueHash(data);
-				if (isDuplicateEntry(uniqueHash, processedHashes)) {
-					// Skip duplicate message
-					return;
-				}
-
-				// Mark this combination as processed
-				markAsProcessed(uniqueHash, processedHashes);
-
-				const cost =
-					fetcher != null ? await calculateCostForEntry(data, mode, fetcher) : (data.costUSD ?? 0);
-
-				// Get Claude Code usage limit expiration date
-				const usageLimitResetTime = getUsageLimitResetTime(data);
-
-				allEntries.push({
-					timestamp: new Date(data.timestamp),
-					usage: {
-						inputTokens: data.message.usage.input_tokens,
-						outputTokens: data.message.usage.output_tokens,
-						cacheCreationInputTokens: data.message.usage.cache_creation_input_tokens ?? 0,
-						cacheReadInputTokens: data.message.usage.cache_read_input_tokens ?? 0,
-					},
-					costUSD: cost,
-					model: getDisplayModelName(data) ?? 'unknown',
-					version: data.version,
-					usageLimitResetTime: usageLimitResetTime ?? undefined,
-				});
-			} catch (error) {
-				// Skip invalid JSON lines but log for debugging purposes
-				logger.debug(
-					`Skipping invalid JSON line in 5-hour blocks: ${error instanceof Error ? error.message : String(error)}`,
-				);
+	const workerFileResults = await collectWithUsageWorkers<string, EncodedBlockFileResult>(
+		'blocks',
+		mtimeFilteredFiles,
+		{
+			mode,
+			offline: options?.offline,
+			timezone: options?.timezone,
+			singleThread: options?.singleThread,
+		},
+	);
+	if (workerFileResults == null) {
+		using fetcher = mode === 'display' ? null : new PricingFetcher(options?.offline);
+		const calculateCost = await createCostCalculator(mode, fetcher);
+		const fileResults = await mapWithConcurrency(
+			mtimeFilteredFiles,
+			getJSONLFileReadConcurrency(mtimeFilteredFiles.length, options?.singleThread),
+			async (file): Promise<BlockFileResult> => collectBlockFileResult(file, calculateCost),
+		);
+		fileResults.sort(compareBlockFileResults);
+		for (const { entries } of fileResults) {
+			for (const entry of entries) {
+				mergeBlockEntry(entry);
 			}
-		});
+		}
+	} else {
+		workerFileResults.sort(compareBlockFileResults);
+		for (const encodedResult of workerFileResults) {
+			forEachBlockEntry(encodedResult, mergeBlockEntry);
+		}
 	}
 
 	// Identify session blocks
@@ -1454,10 +3185,7 @@ export async function loadSessionBlockData(options?: LoadOptions): Promise<Sessi
 		(options?.since != null && options.since !== '') ||
 		(options?.until != null && options.until !== '')
 			? blocks.filter((block) => {
-					const blockDateStr = formatDate(block.startTime.toISOString(), options?.timezone).replace(
-						/-/g,
-						'',
-					);
+					const blockDateStr = formatUsageDate(block.startTime.toISOString()).replace(/-/g, '');
 					if (options.since != null && options.since !== '' && blockDateStr < options.since) {
 						return false;
 					}
@@ -1472,7 +3200,107 @@ export async function loadSessionBlockData(options?: LoadOptions): Promise<Sessi
 	return sortByDate(dateFiltered, (block) => block.startTime, options?.order);
 }
 
+async function runUsageWorker(data: UsageWorkerData): Promise<void> {
+	using fetcher = data.mode === 'display' ? null : new PricingFetcher(data.offline);
+	const calculateCost = await createCostCalculator(data.mode, fetcher, data.pricing);
+	const formatUsageDate = createCachedDateFormatter(data.timezone);
+
+	switch (data.task) {
+		case 'daily': {
+			const results = [];
+			const transferList: ArrayBuffer[] = [];
+			for (const { index, item } of data.items as Array<IndexedWorkerItem<string>>) {
+				const result = encodeDailyDataEntries(
+					await collectDailyEntriesFromFile(item, calculateCost, formatUsageDate),
+				);
+				transferList.push(result.numbers.buffer as ArrayBuffer, result.flags.buffer as ArrayBuffer);
+				results.push({
+					index,
+					result,
+				});
+			}
+			parentPort!.postMessage(
+				{ results } satisfies UsageWorkerResponse<EncodedDailyDataEntries>,
+				transferList,
+			);
+			return;
+		}
+		case 'session': {
+			const results = [];
+			const transferList: ArrayBuffer[] = [];
+			for (const { index, item } of data.items as Array<IndexedWorkerItem<GlobResult>>) {
+				const result = encodeSessionDataEntries(
+					await collectSessionEntriesFromFile(item, data.mode, calculateCost),
+				);
+				transferList.push(result.numbers.buffer as ArrayBuffer, result.flags.buffer as ArrayBuffer);
+				results.push({
+					index,
+					result,
+				});
+			}
+			parentPort!.postMessage(
+				{ results } satisfies UsageWorkerResponse<EncodedSessionDataEntries>,
+				transferList,
+			);
+			return;
+		}
+		case 'blocks': {
+			const results = [];
+			const transferList: ArrayBuffer[] = [];
+			for (const { index, item } of data.items as Array<IndexedWorkerItem<string>>) {
+				const result = encodeBlockFileResult(await collectBlockFileResult(item, calculateCost));
+				transferList.push(result.numbers.buffer as ArrayBuffer, result.flags.buffer as ArrayBuffer);
+				results.push({
+					index,
+					result,
+				});
+			}
+			parentPort!.postMessage(
+				{ results } satisfies UsageWorkerResponse<EncodedBlockFileResult>,
+				transferList,
+			);
+			return;
+		}
+		default:
+			unreachable(data.task);
+	}
+}
+
+if (!isMainThread && isRecord(workerData) && workerData.kind === 'ccusage:usage-worker') {
+	void runUsageWorker(workerData as UsageWorkerData).catch(() => {
+		process.exit(1);
+	});
+}
+
 if (import.meta.vitest != null) {
+	describe('fast JSONL parser helpers', () => {
+		it('parses token counters after fixed markers', () => {
+			const line = '{"usage":{"input_tokens":12345,"output_tokens":678}}';
+
+			expect(extractUnsignedIntegerMarker(line, INPUT_TOKENS_MARKER)).toBe(12345);
+			expect(extractUnsignedIntegerMarker(line, OUTPUT_TOKENS_MARKER)).toBe(678);
+			expect(extractUnsignedIntegerMarker(line, CACHE_READ_INPUT_TOKENS_MARKER)).toBeUndefined();
+			expect(
+				extractUnsignedIntegerMarker('{"input_tokens":-1}', INPUT_TOKENS_MARKER),
+			).toBeUndefined();
+		});
+
+		it('parses JSON number cost values after fixed markers', () => {
+			expect(extractJsonNumberMarker('{"costUSD":12}', COST_USD_MARKER)).toBe(12);
+			expect(extractJsonNumberMarker('{"costUSD":-0.125}', COST_USD_MARKER)).toBe(-0.125);
+			expect(extractJsonNumberMarker('{"costUSD":1.25e-3}', COST_USD_MARKER)).toBe(0.00125);
+			expect(extractJsonNumberMarker('{"costUSD":1e+2}', COST_USD_MARKER)).toBe(100);
+			expect(extractJsonNumberMarker('{"costUSD":null}', COST_USD_MARKER)).toBeUndefined();
+		});
+
+		it('detects only null fields that change fast parser semantics', () => {
+			expect(hasUnsupportedNullField('{"message":{"content":null}}')).toBe(false);
+			expect(hasUnsupportedNullField('{"message":{"model":null}}')).toBe(true);
+			expect(hasUnsupportedNullField('{"message":{"usage":{"speed":null}}}')).toBe(true);
+			expect(hasUnsupportedNullField('{"requestId":null}')).toBe(true);
+		});
+	});
+
 	describe('formatDate', () => {
 		it('formats UTC timestamp to local date', () => {
 			// Test with UTC timestamps - results depend on local timezone
@@ -1498,22 +3326,6 @@ if (import.meta.vitest != null) {
 
 			// Invalid timezone should throw a RangeError
 			expect(() => formatDate(testTimestamp, 'Invalid/Timezone')).toThrow(RangeError);
-		});
-
-		it('formatDateCompact respects timezone parameter', () => {
-			const testTimestamp = '2024-01-01T15:00:00Z';
-
-			// UTC timezone
-			expect(formatDateCompact(testTimestamp, 'UTC', 'en-US')).toBe('2024\n01-01');
-
-			// Asia/Tokyo timezone (crosses to next day)
-			expect(formatDateCompact(testTimestamp, 'Asia/Tokyo', 'en-US')).toBe('2024\n01-02');
-
-			// Daily date defined as UTC is preserved
-			expect(formatDateCompact('2024-01-01', 'UTC', 'en-US')).toBe('2024\n01-01');
-
-			// Daily date already in local time is preserved instead of being interpreted as UTC
-			expect(formatDateCompact('2024-01-01', undefined, 'en-US')).toBe('2024\n01-01');
 		});
 
 		it('handles various date formats', () => {
@@ -1612,36 +3424,18 @@ if (import.meta.vitest != null) {
 		});
 	});
 
-	describe('formatDateCompact', () => {
-		it('formats UTC timestamp to local date with line break', () => {
-			expect(formatDateCompact('2024-01-01T00:00:00Z', undefined, 'en-US')).toBe('2024\n01-01');
-		});
-
-		it('handles various date formats', () => {
-			expect(formatDateCompact('2024-12-31T23:59:59Z', undefined, 'en-US')).toBe('2024\n12-31');
-			expect(formatDateCompact('2024-01-01', undefined, 'en-US')).toBe('2024\n01-01');
-			expect(formatDateCompact('2024-01-01T12:00:00', undefined, 'en-US')).toBe('2024\n01-01');
-			expect(formatDateCompact('2024-01-01T12:00:00.000Z', undefined, 'en-US')).toBe('2024\n01-01');
-		});
-
-		it('pads single digit months and days', () => {
-			// Use UTC noon to avoid timezone issues
-			expect(formatDateCompact('2024-01-05T12:00:00Z', undefined, 'en-US')).toBe('2024\n01-05');
-			expect(formatDateCompact('2024-10-01T12:00:00Z', undefined, 'en-US')).toBe('2024\n10-01');
-		});
-
-		it('respects locale parameter', () => {
-			const testDate = '2024-08-04T12:00:00Z';
-
-			// Different locales format dates differently
-			expect(formatDateCompact(testDate, 'UTC', 'en-US')).toBe('2024\n08-04');
-			expect(formatDateCompact(testDate, 'UTC', 'en-CA')).toBe('2024\n08-04');
-			expect(formatDateCompact(testDate, 'UTC', 'ja-JP')).toBe('2024\n08-04');
-			// All locales should produce similar compact format
-		});
-	});
-
 	describe('getDisplayModelName', () => {
+		it('sums all token fields used for dedupe preference', () => {
+			expect(
+				sumUsageTokens({
+					input_tokens: 100,
+					output_tokens: 50,
+					cache_creation_input_tokens: 25,
+					cache_read_input_tokens: 10,
+				}),
+			).toBe(185);
+		});
+
 		it('returns model name as-is for standard speed', () => {
 			const data: UsageData = {
 				timestamp: createISOTimestamp('2024-01-01T10:00:00Z'),
@@ -1683,6 +3477,118 @@ if (import.meta.vitest != null) {
 				},
 			};
 			expect(getDisplayModelName(data)).toBeUndefined();
+		});
+	});
+
+	describe('summarizeUsageEntries', () => {
+		it('aggregates totals, models, and model breakdowns in one result', () => {
+			const sonnet: UsageData = {
+				timestamp: createISOTimestamp('2024-01-01T10:00:00Z'),
+				message: {
+					usage: {
+						input_tokens: 100,
+						output_tokens: 50,
+						cache_creation_input_tokens: 25,
+						cache_read_input_tokens: 10,
+					},
+					model: createModelName('claude-sonnet-4-20250514'),
+				},
+			};
+			const fastSonnet: UsageData = {
+				timestamp: createISOTimestamp('2024-01-01T11:00:00Z'),
+				message: {
+					usage: {
+						input_tokens: 200,
+						output_tokens: 75,
+						cache_creation_input_tokens: 5,
+						cache_read_input_tokens: 15,
+						speed: 'fast',
+					},
+					model: createModelName('claude-sonnet-4-20250514'),
+				},
+			};
+			const synthetic: UsageData = {
+				timestamp: createISOTimestamp('2024-01-01T12:00:00Z'),
+				message: {
+					usage: {
+						input_tokens: 300,
+						output_tokens: 125,
+					},
+					model: createModelName('<synthetic>'),
+				},
+			};
+
+			const result = summarizeUsageEntries(
+				[
+					{ data: sonnet, cost: 0.01, model: getDisplayModelName(sonnet) },
+					{ data: fastSonnet, cost: 0.02, model: getDisplayModelName(fastSonnet) },
+					{ data: synthetic, cost: 0.03, model: getDisplayModelName(synthetic) },
+				],
+				(entry) => entry.model,
+				(entry) => entry.data.message.usage,
+				(entry) => entry.cost,
+			);
+
+			expect(result.inputTokens).toBe(600);
+			expect(result.outputTokens).toBe(250);
+			expect(result.cacheCreationTokens).toBe(30);
+			expect(result.cacheReadTokens).toBe(25);
+			expect(result.totalCost).toBe(0.06);
+			expect(result.modelsUsed).toEqual([
+				'claude-sonnet-4-20250514',
+				'claude-sonnet-4-20250514-fast',
+			]);
+			expect(result.modelBreakdowns).toEqual([
+				{
+					modelName: 'claude-sonnet-4-20250514-fast',
+					inputTokens: 200,
+					outputTokens: 75,
+					cacheCreationTokens: 5,
+					cacheReadTokens: 15,
+					cost: 0.02,
+				},
+				{
+					modelName: 'claude-sonnet-4-20250514',
+					inputTokens: 100,
+					outputTokens: 50,
+					cacheCreationTokens: 25,
+					cacheReadTokens: 10,
+					cost: 0.01,
+				},
+			]);
+		});
+
+		it('keeps unknown breakdowns out of modelsUsed unless the model name is explicit', () => {
+			const unknownModelUsage = {
+				input_tokens: 10,
+				output_tokens: 5,
+			};
+			const explicitUnknownModelUsage = {
+				input_tokens: 20,
+				output_tokens: 10,
+			};
+
+			const result = summarizeUsageEntries(
+				[
+					{ cost: 0.01, model: undefined, usage: unknownModelUsage },
+					{ cost: 0.02, model: 'unknown', usage: explicitUnknownModelUsage },
+				],
+				(entry) => entry.model,
+				(entry) => entry.usage,
+				(entry) => entry.cost,
+			);
+
+			expect(result.modelsUsed).toEqual(['unknown']);
+			expect(result.modelBreakdowns).toEqual([
+				{
+					modelName: 'unknown',
+					inputTokens: 30,
+					outputTokens: 15,
+					cacheCreationTokens: 0,
+					cacheReadTokens: 0,
+					cost: 0.03,
+				},
+			]);
 		});
 	});
 
@@ -4082,6 +5988,60 @@ invalid json line
 			expect(calculateResult[0]?.costUSD).toBeGreaterThan(0);
 		});
 
+		it('keeps the most complete duplicate usage entry', async () => {
+			await using fixture = await createFixture({
+				projects: {
+					project1: {
+						session1: {
+							'chat.jsonl': [
+								JSON.stringify({
+									timestamp: '2025-01-10T10:00:00.000Z',
+									message: {
+										id: 'msg_123',
+										model: 'claude-opus-4-6',
+										usage: {
+											input_tokens: 100,
+											output_tokens: 25,
+											cache_creation_input_tokens: 10,
+											cache_read_input_tokens: 5,
+										},
+									},
+									requestId: 'req_456',
+									costUSD: 0.001,
+								}),
+								JSON.stringify({
+									timestamp: '2025-01-10T10:00:01.000Z',
+									message: {
+										id: 'msg_123',
+										model: 'claude-opus-4-6',
+										usage: {
+											input_tokens: 100,
+											output_tokens: 250,
+											cache_creation_input_tokens: 10,
+											cache_read_input_tokens: 5,
+											speed: 'standard',
+										},
+									},
+									requestId: 'req_456',
+									costUSD: 0.01,
+								}),
+							].join('\n'),
+						},
+					},
+				},
+			});
+
+			const result = await loadSessionBlockData({
+				claudePath: fixture.path,
+				mode: 'display',
+			});
+
+			const usageBlock = result.find((block) => block.isGap !== true);
+			expect(usageBlock?.tokenCounts.inputTokens).toBe(100);
+			expect(usageBlock?.tokenCounts.outputTokens).toBe(250);
+			expect(usageBlock?.costUSD).toBe(0.01);
+		});
+
 		it('filters by date range correctly', async () => {
 			const date1 = new Date('2024-01-01T10:00:00Z');
 			const date2 = new Date('2024-01-02T10:00:00Z');
@@ -4472,6 +6432,20 @@ if (import.meta.vitest != null) {
 			});
 		});
 
+		describe('createDedupedEntryIndex', () => {
+			it('stores exact string keys without inherited prototype collisions', () => {
+				const index = createDedupedEntryIndex();
+				const protoKey = '__proto__';
+
+				index['msg_1:req_1'] = 1;
+				index[protoKey] = 2;
+
+				expect(index['msg_1:req_1']).toBe(1);
+				expect(index[protoKey]).toBe(2);
+				expect(Object.getPrototypeOf(index)).toBeNull();
+			});
+		});
+
 		describe('getEarliestTimestamp', () => {
 			it('should extract earliest timestamp from JSONL file', async () => {
 				const content = [
@@ -4552,6 +6526,69 @@ if (import.meta.vitest != null) {
 			});
 		});
 
+		describe('filterFilesByMtime', () => {
+			it('should keep only files modified near or after since date', async () => {
+				await using fixture = await createFixture({
+					'old.jsonl': '',
+					'recent.jsonl': '',
+				});
+
+				const oldFile = fixture.getPath('old.jsonl');
+				const recentFile = fixture.getPath('recent.jsonl');
+				await utimes(oldFile, new Date('2025-01-08T00:00:00Z'), new Date('2025-01-08T00:00:00Z'));
+				await utimes(
+					recentFile,
+					new Date('2025-01-09T00:00:00Z'),
+					new Date('2025-01-09T00:00:00Z'),
+				);
+
+				const filtered = await filterFilesByMtime(
+					[oldFile, recentFile],
+					(filePath) => filePath,
+					'20250110',
+				);
+
+				expect(filtered).toEqual([recentFile]);
+			});
+
+			it('should leave files unchanged when since is invalid', async () => {
+				await using fixture = await createFixture({
+					'file1.jsonl': '',
+					'file2.jsonl': '',
+				});
+
+				const files = [fixture.getPath('file1.jsonl'), fixture.getPath('file2.jsonl')];
+				const filtered = await filterFilesByMtime(files, (filePath) => filePath, '20250231');
+
+				expect(filtered).toEqual(files);
+			});
+
+			it('should use explicit minimum update time when provided', async () => {
+				await using fixture = await createFixture({
+					'old.jsonl': '',
+					'recent.jsonl': '',
+				});
+
+				const oldFile = fixture.getPath('old.jsonl');
+				const recentFile = fixture.getPath('recent.jsonl');
+				await utimes(oldFile, new Date('2025-01-10T00:00:00Z'), new Date('2025-01-10T00:00:00Z'));
+				await utimes(
+					recentFile,
+					new Date('2025-01-10T12:00:00Z'),
+					new Date('2025-01-10T12:00:00Z'),
+				);
+
+				const filtered = await filterFilesByMtime(
+					[oldFile, recentFile],
+					(filePath) => filePath,
+					undefined,
+					new Date('2025-01-10T06:00:00Z'),
+				);
+
+				expect(filtered).toEqual([recentFile]);
+			});
+		});
+
 		describe('loadDailyUsageData with deduplication', () => {
 			it('should deduplicate entries with same message and request IDs', async () => {
 				await using fixture = await createFixture({
@@ -4594,14 +6631,12 @@ if (import.meta.vitest != null) {
 					mode: 'display',
 				});
 
-				// Should only have one entry for 2025-01-10
 				expect(data).toHaveLength(1);
-				expect(data[0]?.date).toBe('2025-01-10');
 				expect(data[0]?.inputTokens).toBe(100);
 				expect(data[0]?.outputTokens).toBe(50);
 			});
 
-			it('should process files in chronological order', async () => {
+			it('keeps the duplicate with more usage tokens across files', async () => {
 				await using fixture = await createFixture({
 					projects: {
 						'newer.jsonl': JSON.stringify({
@@ -4636,11 +6671,64 @@ if (import.meta.vitest != null) {
 					mode: 'display',
 				});
 
-				// Should keep the older entry (100/50 tokens) not the newer one (200/100)
 				expect(data).toHaveLength(1);
-				expect(data[0]?.date).toBe('2025-01-10');
+				expect(data[0]?.date).toBe('2025-01-15');
+				expect(data[0]?.inputTokens).toBe(200);
+				expect(data[0]?.outputTokens).toBe(100);
+			});
+
+			it('keeps the most complete duplicate usage entry', async () => {
+				await using fixture = await createFixture({
+					projects: {
+						project1: {
+							session1: {
+								'chat.jsonl': [
+									JSON.stringify({
+										timestamp: '2025-01-10T10:00:00.000Z',
+										message: {
+											id: 'msg_123',
+											model: 'claude-opus-4-6',
+											usage: {
+												input_tokens: 100,
+												output_tokens: 25,
+												cache_creation_input_tokens: 10,
+												cache_read_input_tokens: 5,
+											},
+										},
+										requestId: 'req_456',
+										costUSD: 0.001,
+									}),
+									JSON.stringify({
+										timestamp: '2025-01-10T10:00:01.000Z',
+										message: {
+											id: 'msg_123',
+											model: 'claude-opus-4-6',
+											usage: {
+												input_tokens: 100,
+												output_tokens: 250,
+												cache_creation_input_tokens: 10,
+												cache_read_input_tokens: 5,
+												speed: 'standard',
+											},
+										},
+										requestId: 'req_456',
+										costUSD: 0.01,
+									}),
+								].join('\n'),
+							},
+						},
+					},
+				});
+
+				const data = await loadDailyUsageData({
+					claudePath: fixture.path,
+					mode: 'display',
+				});
+
+				expect(data).toHaveLength(1);
 				expect(data[0]?.inputTokens).toBe(100);
-				expect(data[0]?.outputTokens).toBe(50);
+				expect(data[0]?.outputTokens).toBe(250);
+				expect(data[0]?.totalCost).toBe(0.01);
 			});
 		});
 
@@ -4686,21 +6774,9 @@ if (import.meta.vitest != null) {
 					mode: 'display',
 				});
 
-				// Session 1 should have the entry
-				const session1 = sessions.find((s) => s.sessionId === 'session1');
-				expect(session1).toBeDefined();
-				expect(session1?.inputTokens).toBe(100);
-				expect(session1?.outputTokens).toBe(50);
-
-				// Session 2 should either not exist or have 0 tokens (duplicate was skipped)
-				const session2 = sessions.find((s) => s.sessionId === 'session2');
-				if (session2 != null) {
-					expect(session2.inputTokens).toBe(0);
-					expect(session2.outputTokens).toBe(0);
-				} else {
-					// It's also valid for session2 to not be included if it has no entries
-					expect(sessions.length).toBe(1);
-				}
+				expect(sessions).toHaveLength(1);
+				expect(sessions[0]?.inputTokens).toBe(100);
+				expect(sessions[0]?.outputTokens).toBe(50);
 			});
 		});
 	});
@@ -4809,6 +6885,152 @@ if (import.meta.vitest != null) {
 			expect(targetDate?.outputTokens).toBe(150);
 			expect(targetDate?.totalCost).toBe(0.03);
 		}, 30000);
+	});
+
+	describe('JSONL worker count', () => {
+		it('uses more workers for daily and session tasks than block-style defaults', () => {
+			const availableParallelism = vi.spyOn(os, 'availableParallelism').mockReturnValue(11);
+			try {
+				expect(getDefaultJSONLWorkerThreadCount(100)).toBe(6);
+				expect(getDefaultJSONLWorkerThreadCount(100, true)).toBe(9);
+			} finally {
+				availableParallelism.mockRestore();
+			}
+		});
+
+		it('does not exceed the number of files', () => {
+			const availableParallelism = vi.spyOn(os, 'availableParallelism').mockReturnValue(11);
+			try {
+				expect(getDefaultJSONLWorkerThreadCount(5, true)).toBe(5);
+			} finally {
+				availableParallelism.mockRestore();
+			}
+		});
+	});
+
+	describe('daily worker column encoding', () => {
+		it('round-trips daily worker entries', () => {
+			const entries: DailyDataEntry[] = [
+				{
+					date: '2026-05-13',
+					cost: 1.25,
+					inputTokens: 1,
+					outputTokens: 2,
+					cacheCreationTokens: 3,
+					cacheReadTokens: 4,
+					model: 'opus-4-7-fast',
+					project: 'ccusage',
+					uniqueHash: 'message:request',
+					tokenTotal: 10,
+					hasSpeed: true,
+				},
+				{
+					date: '2026-05-14',
+					cost: 0,
+					inputTokens: 5,
+					outputTokens: 6,
+					cacheCreationTokens: 0,
+					cacheReadTokens: 0,
+					model: undefined,
+					project: 'ccusage',
+					uniqueHash: null,
+					tokenTotal: 11,
+					hasSpeed: false,
+				},
+			];
+
+			expect(decodeDailyDataEntries(encodeDailyDataEntries(entries))).toEqual(entries);
+		});
+	});
+
+	describe('session worker column encoding', () => {
+		it('round-trips session worker entries', () => {
+			const entries: SessionDataEntry[] = [
+				{
+					sessionKey: 'project/session-a',
+					sessionId: 'session-a',
+					projectPath: 'project',
+					cost: 1.25,
+					timestamp: '2026-05-14T01:02:03.000Z',
+					model: 'haiku-4-5',
+					inputTokens: 1,
+					outputTokens: 2,
+					cacheCreationTokens: 3,
+					cacheReadTokens: 4,
+					uniqueHash: 'message:request',
+					tokenTotal: 10,
+					hasSpeed: false,
+					version: '1.2.3' as Version,
+				},
+				{
+					sessionKey: 'project/session-a',
+					sessionId: 'session-a',
+					projectPath: 'project',
+					cost: 0,
+					timestamp: '2026-05-14T02:03:04.000Z',
+					model: undefined,
+					inputTokens: 5,
+					outputTokens: 6,
+					cacheCreationTokens: 0,
+					cacheReadTokens: 0,
+					uniqueHash: null,
+					tokenTotal: 11,
+					hasSpeed: true,
+					version: undefined,
+				},
+			];
+
+			expect(decodeSessionDataEntries(encodeSessionDataEntries(entries))).toEqual(entries);
+		});
+	});
+
+	describe('block worker column encoding', () => {
+		it('round-trips block worker entries', () => {
+			const result: BlockFileResult = {
+				file: '/tmp/project/session.jsonl',
+				timestampMs: Date.UTC(2026, 4, 14, 1, 2, 3),
+				entries: [
+					{
+						entry: {
+							timestamp: new Date(Date.UTC(2026, 4, 14, 1, 2, 3)),
+							timestampMs: Date.UTC(2026, 4, 14, 1, 2, 3),
+							usage: {
+								inputTokens: 1,
+								outputTokens: 2,
+								cacheCreationInputTokens: 3,
+								cacheReadInputTokens: 4,
+							},
+							costUSD: 1.25,
+							model: 'haiku-4-5',
+							version: '1.2.3',
+							usageLimitResetTime: new Date(Date.UTC(2026, 4, 14, 2, 0, 0)),
+						},
+						uniqueHash: 'message:request',
+						tokenTotal: 10,
+						hasSpeed: true,
+					},
+					{
+						entry: {
+							timestamp: new Date(Date.UTC(2026, 4, 14, 3, 4, 5)),
+							timestampMs: Date.UTC(2026, 4, 14, 3, 4, 5),
+							usage: {
+								inputTokens: 5,
+								outputTokens: 6,
+								cacheCreationInputTokens: 0,
+								cacheReadInputTokens: 0,
+							},
+							costUSD: 0,
+							model: 'unknown',
+						},
+						uniqueHash: null,
+						tokenTotal: 11,
+						hasSpeed: false,
+					},
+				],
+			};
+
+			expect(decodeBlockFileResult(encodeBlockFileResult(result))).toEqual(result);
+		});
 	});
 
 	describe('globUsageFiles', () => {

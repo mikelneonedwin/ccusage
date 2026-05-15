@@ -1,11 +1,10 @@
 import type { Formatter } from 'picocolors/types';
-import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
+import { createJsonFileState } from '@ccusage/internal/json-file-state';
 import { formatCurrency } from '@ccusage/terminal/table';
 import { Result } from '@praha/byethrow';
-import { createLimoJson } from '@ryoppippi/limo';
 import getStdin from 'get-stdin';
 import { define } from 'gunshi';
 import pc from 'picocolors';
@@ -44,17 +43,13 @@ function formatRemainingTime(remaining: number): string {
  * Gets semaphore file for session-specific caching and process coordination
  * Uses time-based expiry and transcript file modification detection for cache invalidation
  */
-function getSemaphore(
-	sessionId: string,
-): ReturnType<typeof createLimoJson<SemaphoreType | undefined>> {
-	const semaphoreDir = join(tmpdir(), 'ccusage-semaphore');
-	const semaphorePath = join(semaphoreDir, `${sessionId}.lock`);
-
-	// Ensure semaphore directory exists
-	mkdirSync(semaphoreDir, { recursive: true });
-
-	const semaphore = createLimoJson<SemaphoreType>(semaphorePath);
-	return semaphore;
+function getSemaphore(sessionId: string): {
+	data: SemaphoreType | undefined;
+	[Symbol.dispose]: () => void;
+} {
+	return createJsonFileState<SemaphoreType>(
+		join(tmpdir(), 'ccusage-semaphore', `${sessionId}.lock`),
+	);
 }
 
 /**
@@ -335,6 +330,8 @@ export const statuslineCommand = define({
 					// Load today's usage data
 					const today = new Date();
 					const todayStr = today.toISOString().split('T')[0]?.replace(/-/g, '') ?? ''; // Convert to YYYYMMDD format
+					const midnightToday = new Date();
+					midnightToday.setHours(0, 0, 0, 0);
 
 					const todayCost = await Result.pipe(
 						Result.try({
@@ -344,6 +341,7 @@ export const statuslineCommand = define({
 									until: todayStr,
 									mode: 'auto',
 									offline: mergedOptions.offline,
+									minUpdateTime: midnightToday,
 								}),
 							catch: (error) => error,
 						})(),
@@ -359,12 +357,14 @@ export const statuslineCommand = define({
 					);
 
 					// Load session block data to find active block
+					const lastBlocksTime = new Date(Date.now() - 24 * 60 * 60 * 1000);
 					const { blockInfo, burnRateInfo } = await Result.pipe(
 						Result.try({
 							try: async () =>
 								loadSessionBlockData({
 									mode: 'auto',
 									offline: mergedOptions.offline,
+									minUpdateTime: lastBlocksTime,
 								}),
 							catch: (error) => error,
 						})(),
