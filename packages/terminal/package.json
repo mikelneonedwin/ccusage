@@ -16,10 +16,10 @@
 	},
 	"dependencies": {
 		"@oxc-project/runtime": "catalog:build",
-		"ansi-escapes": "catalog:runtime",
-		"picocolors": "catalog:runtime"
+		"ansi-escapes": "catalog:runtime"
 	},
 	"devDependencies": {
+		"@ccusage/internal": "workspace:*",
 		"@ryoppippi/eslint-config": "catalog:lint",
 		"eslint": "catalog:lint",
 		"eslint-plugin-format": "catalog:lint",

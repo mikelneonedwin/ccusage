@@ -15,6 +15,7 @@ import { log, logger } from '../logger.ts';
 export const sessionCommand = define({
 	name: 'session',
 	description: 'Show pi-agent usage by session',
+	toKebab: true,
 	args: {
 		json: {
 			type: 'boolean',
@@ -136,7 +137,14 @@ export const sessionCommand = define({
 			});
 			table.push(totalsRow);
 
-			log(table.toString());
+			const renderedTable = table.toString();
+			log(renderedTable);
+
+			if (table.isCompactMode()) {
+				log();
+				logger.info('Running in Compact Mode');
+				logger.info('Expand terminal width to see cache metrics and total tokens');
+			}
 		}
 	},
 });

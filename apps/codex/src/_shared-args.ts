@@ -1,5 +1,4 @@
 import type { Args } from 'gunshi';
-import { DEFAULT_TIMEZONE } from './_consts.ts';
 
 export const sharedArgs = {
 	json: {
@@ -22,7 +21,6 @@ export const sharedArgs = {
 		type: 'string',
 		short: 'z',
 		description: 'Timezone for date grouping (IANA)',
-		default: DEFAULT_TIMEZONE,
 	},
 	offline: {
 		type: 'boolean',
@@ -43,12 +41,12 @@ export const sharedArgs = {
 		default: false,
 	},
 	color: {
-		// --color and FORCE_COLOR=1 is handled by picocolors
+		// --color and FORCE_COLOR=1 are handled by the shared styleText color helper
 		type: 'boolean',
 		description: 'Enable colored output (default: auto). FORCE_COLOR=1 has the same effect.',
 	},
 	noColor: {
-		// --no-color and NO_COLOR=1 is handled by picocolors
+		// --no-color and NO_COLOR=1 are handled by the shared styleText color helper
 		type: 'boolean',
 		description: 'Disable colored output (default: auto). NO_COLOR=1 has the same effect.',
 	},

@@ -1,4 +1,6 @@
 import type { TokenUsageEvent } from '../_types.ts';
+import * as pc from '@ccusage/internal/colors';
+import { writeStdoutLine } from '@ccusage/internal/logger';
 import { compareStrings } from '@ccusage/internal/sort';
 import {
 	addEmptySeparatorRow,
@@ -9,8 +11,8 @@ import {
 	ResponsiveTable,
 } from '@ccusage/terminal/table';
 import { define } from 'gunshi';
-import pc from 'picocolors';
 import { loadAmpUsageEvents } from '../data-loader.ts';
+import { logger } from '../logger.ts';
 import { AmpPricingSource } from '../pricing.ts';
 
 const TABLE_COLUMN_COUNT = 9;
@@ -42,9 +44,20 @@ export const monthlyCommand = define({
 			type: 'boolean',
 			description: 'Force compact table mode',
 		},
+		offline: {
+			type: 'boolean',
+			negatable: true,
+			short: 'O',
+			description: 'Use cached pricing data',
+			default: false,
+		},
 	},
 	async run(ctx) {
 		const jsonOutput = Boolean(ctx.values.json);
+
+		if (!jsonOutput) {
+			logger.box('Amp Token Usage Report - Monthly');
+		}
 
 		const { events } = await loadAmpUsageEvents();
 
@@ -52,12 +65,11 @@ export const monthlyCommand = define({
 			const output = jsonOutput
 				? JSON.stringify({ monthly: [], totals: null })
 				: 'No Amp usage data found.';
-			// eslint-disable-next-line no-console
-			console.log(output);
+			await writeStdoutLine(output);
 			return;
 		}
 
-		using pricingSource = new AmpPricingSource({ offline: false });
+		using pricingSource = new AmpPricingSource({ offline: Boolean(ctx.values.offline) });
 
 		const eventsByMonth = groupByMonth(events);
 
@@ -99,7 +111,7 @@ export const monthlyCommand = define({
 				modelsSet.add(event.model);
 			}
 
-			const totalTokens = inputTokens + outputTokens;
+			const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
 
 			monthlyData.push({
 				month,
@@ -127,8 +139,7 @@ export const monthlyCommand = define({
 		};
 
 		if (jsonOutput) {
-			// eslint-disable-next-line no-console
-			console.log(
+			await writeStdoutLine(
 				JSON.stringify(
 					{
 						monthly: monthlyData,
@@ -140,9 +151,6 @@ export const monthlyCommand = define({
 			);
 			return;
 		}
-
-		// eslint-disable-next-line no-console
-		console.log('\n📊 Amp Token Usage Report - Monthly\n');
 
 		const table: ResponsiveTable = new ResponsiveTable({
 			head: [
@@ -159,6 +167,10 @@ export const monthlyCommand = define({
 			colAligns: ['left', 'left', 'right', 'right', 'right', 'right', 'right', 'right', 'right'],
 			compactHead: ['Month', 'Models', 'Input', 'Output', 'Credits', 'Cost (USD)'],
 			compactColAligns: ['left', 'left', 'right', 'right', 'right', 'right'],
+			minColumnWidths: [12, 14, 11, 11, 11, 11, 11, 9, 14],
+			compactMinColumnWidths: [12, 14, 11, 11, 9, 14],
+			flexibleColumnIndex: 1,
+			compactFlexibleColumnIndex: 1,
 			compactThreshold: 100,
 			forceCompact: Boolean(ctx.values.compact),
 			style: { head: ['cyan'] },
@@ -192,14 +204,14 @@ export const monthlyCommand = define({
 			pc.yellow(formatCurrency(totals.totalCost)),
 		]);
 
-		// eslint-disable-next-line no-console
-		console.log(table.toString());
+		const renderedTable = table.toString();
+
+		await writeStdoutLine(renderedTable);
 
 		if (table.isCompactMode()) {
-			// eslint-disable-next-line no-console
-			console.log('\nRunning in Compact Mode');
-			// eslint-disable-next-line no-console
-			console.log('Expand terminal width to see cache metrics and total tokens');
+			await writeStdoutLine();
+			logger.info('Running in Compact Mode');
+			logger.info('Expand terminal width to see cache metrics and total tokens');
 		}
 	},
 });

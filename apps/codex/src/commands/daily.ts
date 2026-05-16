@@ -1,4 +1,5 @@
 import process from 'node:process';
+import * as pc from '@ccusage/internal/colors';
 import {
 	addEmptySeparatorRow,
 	formatCurrency,
@@ -9,7 +10,6 @@ import {
 } from '@ccusage/terminal/table';
 import { Result } from '@praha/byethrow';
 import { define } from 'gunshi';
-import pc from 'picocolors';
 import { DEFAULT_TIMEZONE } from '../_consts.ts';
 import { sharedArgs } from '../_shared-args.ts';
 import { normalizeSpeedOption, resolveCodexSpeed } from '../codex-config.ts';
@@ -137,6 +137,10 @@ export const dailyCommand = define({
 				colAligns: ['left', 'left', 'right', 'right', 'right', 'right', 'right', 'right'],
 				compactHead: ['Date', 'Models', 'Input', 'Output', 'Cost (USD)'],
 				compactColAligns: ['left', 'left', 'right', 'right', 'right'],
+				minColumnWidths: [12, 14, 11, 11, 11, 11, 11, 14],
+				compactMinColumnWidths: [12, 14, 11, 11, 14],
+				flexibleColumnIndex: 1,
+				compactFlexibleColumnIndex: 1,
 				compactThreshold: 100,
 				forceCompact: ctx.values.compact,
 				style: { head: ['cyan'] },
@@ -185,10 +189,13 @@ export const dailyCommand = define({
 				pc.yellow(formatCurrency(totalsForDisplay.costUSD)),
 			]);
 
-			log(table.toString());
+			const renderedTable = table.toString();
+
+			log(renderedTable);
 
 			if (table.isCompactMode()) {
-				logger.info('\nRunning in Compact Mode');
+				log();
+				logger.info('Running in Compact Mode');
 				logger.info('Expand terminal width to see cache metrics and total tokens');
 			}
 		} finally {

@@ -1,4 +1,5 @@
 import process from 'node:process';
+import * as pc from '@ccusage/internal/colors';
 import {
 	addEmptySeparatorRow,
 	formatCurrency,
@@ -9,7 +10,6 @@ import {
 } from '@ccusage/terminal/table';
 import { Result } from '@praha/byethrow';
 import { define } from 'gunshi';
-import pc from 'picocolors';
 import { DEFAULT_TIMEZONE } from '../_consts.ts';
 import { sharedArgs } from '../_shared-args.ts';
 import { normalizeSpeedOption, resolveCodexSpeed } from '../codex-config.ts';
@@ -159,6 +159,9 @@ export const sessionCommand = define({
 				],
 				compactHead: ['Date', 'Directory', 'Session', 'Input', 'Output', 'Cost (USD)'],
 				compactColAligns: ['left', 'left', 'left', 'right', 'right', 'right'],
+				minColumnWidths: [12, 14, 12, 14, 11, 11, 11, 11, 11, 14, 16],
+				compactMinColumnWidths: [12, 14, 12, 11, 11, 14],
+				flexibleColumnIndex: 3,
 				compactThreshold: 100,
 				forceCompact: ctx.values.compact,
 				style: { head: ['cyan'] },
@@ -219,10 +222,13 @@ export const sessionCommand = define({
 				'',
 			]);
 
-			log(table.toString());
+			const renderedTable = table.toString();
+
+			log(renderedTable);
 
 			if (table.isCompactMode()) {
-				logger.info('\nRunning in Compact Mode');
+				log();
+				logger.info('Running in Compact Mode');
 				logger.info(
 					'Expand terminal width to see directories, cache metrics, total tokens, and last activity',
 				);

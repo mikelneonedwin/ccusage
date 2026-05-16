@@ -1,4 +1,6 @@
 import type { TokenUsageEvent } from '../_types.ts';
+import * as pc from '@ccusage/internal/colors';
+import { writeStdoutLine } from '@ccusage/internal/logger';
 import { compareStrings } from '@ccusage/internal/sort';
 import {
 	addEmptySeparatorRow,
@@ -9,8 +11,8 @@ import {
 	ResponsiveTable,
 } from '@ccusage/terminal/table';
 import { define } from 'gunshi';
-import pc from 'picocolors';
 import { loadAmpUsageEvents } from '../data-loader.ts';
+import { logger } from '../logger.ts';
 import { AmpPricingSource } from '../pricing.ts';
 
 const TABLE_COLUMN_COUNT = 9;
@@ -41,9 +43,20 @@ export const sessionCommand = define({
 			type: 'boolean',
 			description: 'Force compact table mode',
 		},
+		offline: {
+			type: 'boolean',
+			negatable: true,
+			short: 'O',
+			description: 'Use cached pricing data',
+			default: false,
+		},
 	},
 	async run(ctx) {
 		const jsonOutput = Boolean(ctx.values.json);
+
+		if (!jsonOutput) {
+			logger.box('Amp Token Usage Report - Sessions');
+		}
 
 		const { events, threads } = await loadAmpUsageEvents();
 
@@ -51,12 +64,11 @@ export const sessionCommand = define({
 			const output = jsonOutput
 				? JSON.stringify({ sessions: [], totals: null })
 				: 'No Amp usage data found.';
-			// eslint-disable-next-line no-console
-			console.log(output);
+			await writeStdoutLine(output);
 			return;
 		}
 
-		using pricingSource = new AmpPricingSource({ offline: false });
+		using pricingSource = new AmpPricingSource({ offline: Boolean(ctx.values.offline) });
 
 		const eventsByThread = groupByThread(events);
 
@@ -105,7 +117,7 @@ export const sessionCommand = define({
 				}
 			}
 
-			const totalTokens = inputTokens + outputTokens;
+			const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
 			const threadInfo = threads.get(threadId);
 
 			sessionData.push({
@@ -136,8 +148,7 @@ export const sessionCommand = define({
 		};
 
 		if (jsonOutput) {
-			// eslint-disable-next-line no-console
-			console.log(
+			await writeStdoutLine(
 				JSON.stringify(
 					{
 						sessions: sessionData,
@@ -149,9 +160,6 @@ export const sessionCommand = define({
 			);
 			return;
 		}
-
-		// eslint-disable-next-line no-console
-		console.log('\n📊 Amp Token Usage Report - Sessions (Threads)\n');
 
 		const table: ResponsiveTable = new ResponsiveTable({
 			head: [
@@ -168,6 +176,10 @@ export const sessionCommand = define({
 			colAligns: ['left', 'left', 'right', 'right', 'right', 'right', 'right', 'right', 'right'],
 			compactHead: ['Thread', 'Models', 'Input', 'Output', 'Credits', 'Cost (USD)'],
 			compactColAligns: ['left', 'left', 'right', 'right', 'right', 'right'],
+			minColumnWidths: [12, 14, 11, 11, 11, 11, 11, 9, 14],
+			compactMinColumnWidths: [12, 14, 11, 11, 9, 14],
+			flexibleColumnIndex: 1,
+			compactFlexibleColumnIndex: 1,
 			compactThreshold: 100,
 			forceCompact: Boolean(ctx.values.compact),
 			style: { head: ['cyan'] },
@@ -204,14 +216,14 @@ export const sessionCommand = define({
 			pc.yellow(formatCurrency(totals.totalCost)),
 		]);
 
-		// eslint-disable-next-line no-console
-		console.log(table.toString());
+		const renderedTable = table.toString();
+
+		await writeStdoutLine(renderedTable);
 
 		if (table.isCompactMode()) {
-			// eslint-disable-next-line no-console
-			console.log('\nRunning in Compact Mode');
-			// eslint-disable-next-line no-console
-			console.log('Expand terminal width to see cache metrics and total tokens');
+			await writeStdoutLine();
+			logger.info('Running in Compact Mode');
+			logger.info('Expand terminal width to see cache metrics and total tokens');
 		}
 	},
 });

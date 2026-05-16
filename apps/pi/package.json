@@ -2,7 +2,7 @@
 	"name": "@ccusage/pi",
 	"type": "module",
 	"version": "18.0.11",
-	"description": "Pi-agent usage tracking - unified Claude Max usage across Claude Code and pi-agent",
+	"description": "Pi-agent usage tracking - combined Claude Max usage across Claude Code and pi-agent",
 	"author": "ryoppippi",
 	"contributors": [
 		"nicobailon"
@@ -22,11 +22,9 @@
 		".": "./src/index.ts",
 		"./package.json": "./package.json"
 	},
-	"main": "./dist/index.js",
-	"module": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"bin": {
-		"ccusage-pi": "./src/index.ts"
+		"pi": "./src/index.ts"
 	},
 	"files": [
 		"README.md",
@@ -34,7 +32,7 @@
 	],
 	"publishConfig": {
 		"bin": {
-			"ccusage-pi": "./dist/index.js"
+			"pi": "./dist/index.js"
 		},
 		"exports": {
 			".": "./dist/index.js",
@@ -55,6 +53,9 @@
 		"test": "TZ=UTC vitest",
 		"typecheck": "tsgo --noEmit"
 	},
+	"dependencies": {
+		"ccusage": "workspace:*"
+	},
 	"devDependencies": {
 		"@ccusage/internal": "workspace:*",
 		"@ccusage/terminal": "workspace:*",
@@ -63,14 +64,11 @@
 		"@types/bun": "catalog:types",
 		"@typescript/native-preview": "catalog:types",
 		"clean-pkg-json": "catalog:release",
-		"es-toolkit": "catalog:runtime",
 		"eslint": "catalog:lint",
 		"fs-fixture": "catalog:testing",
 		"gunshi": "catalog:runtime",
 		"path-type": "catalog:runtime",
-		"picocolors": "catalog:runtime",
 		"publint": "catalog:lint",
-		"tinyglobby": "catalog:runtime",
 		"tsdown": "catalog:build",
 		"valibot": "catalog:runtime",
 		"vitest": "catalog:testing"

@@ -1,13 +1,13 @@
-import type { Formatter } from 'picocolors/types';
+import type { Formatter } from '@ccusage/internal/colors';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
+import * as pc from '@ccusage/internal/colors';
 import { createJsonFileState } from '@ccusage/internal/json-file-state';
 import { formatCurrency } from '@ccusage/terminal/table';
 import { Result } from '@praha/byethrow';
 import getStdin from 'get-stdin';
 import { define } from 'gunshi';
-import pc from 'picocolors';
 import * as v from 'valibot';
 import { loadConfig, mergeConfigWithArgs } from '../_config-loader-tokens.ts';
 import { DEFAULT_CONTEXT_USAGE_THRESHOLDS, DEFAULT_REFRESH_INTERVAL_SECONDS } from '../_consts.ts';
@@ -93,8 +93,35 @@ const contextThresholdSchema = v.pipe(
 	v.maxValue(100, 'Context threshold must be at most 100'),
 );
 
-function parseContextThreshold(value: string): number {
+function parseContextThreshold(value: unknown): number {
 	return v.parse(contextThresholdSchema, value);
+}
+
+function formatContextInfo(
+	inputTokens: number,
+	contextLimit: number,
+	lowThreshold: number,
+	mediumThreshold: number,
+): string {
+	const percentage = Math.round((inputTokens / contextLimit) * 100);
+	const color = getContextColorFormatter(percentage, lowThreshold, mediumThreshold);
+	const coloredPercentage = color(`${percentage}%`);
+	const tokenDisplay = inputTokens.toLocaleString();
+	return `${tokenDisplay} (${coloredPercentage})`;
+}
+
+function getContextColorFormatter(
+	percentage: number,
+	lowThreshold: number,
+	mediumThreshold: number,
+): Formatter {
+	if (percentage < lowThreshold) {
+		return pc.green;
+	}
+	if (percentage < mediumThreshold) {
+		return pc.yellow;
+	}
+	return pc.red;
 }
 
 export const statuslineCommand = define({
@@ -138,15 +165,13 @@ export const statuslineCommand = define({
 			default: DEFAULT_REFRESH_INTERVAL_SECONDS,
 		},
 		contextLowThreshold: {
-			type: 'custom',
+			type: 'number',
 			description: 'Context usage percentage below which status is shown in green (0-100)',
-			parse: (value) => parseContextThreshold(value),
 			default: DEFAULT_CONTEXT_USAGE_THRESHOLDS.LOW,
 		},
 		contextMediumThreshold: {
-			type: 'custom',
+			type: 'number',
 			description: 'Context usage percentage below which status is shown in yellow (0-100)',
-			parse: (value) => parseContextThreshold(value),
 			default: DEFAULT_CONTEXT_USAGE_THRESHOLDS.MEDIUM,
 		},
 		config: sharedArgs.config,
@@ -156,10 +181,13 @@ export const statuslineCommand = define({
 		// Set logger to silent for statusline output
 		logger.level = 0;
 
+		const contextLowThreshold = parseContextThreshold(ctx.values.contextLowThreshold);
+		const contextMediumThreshold = parseContextThreshold(ctx.values.contextMediumThreshold);
+
 		// Validate threshold ordering constraint: LOW must be less than MEDIUM
-		if (ctx.values.contextLowThreshold >= ctx.values.contextMediumThreshold) {
+		if (contextLowThreshold >= contextMediumThreshold) {
 			throw new Error(
-				`Context low threshold (${ctx.values.contextLowThreshold}) must be less than medium threshold (${ctx.values.contextMediumThreshold})`,
+				`Context low threshold (${contextLowThreshold}) must be less than medium threshold (${contextMediumThreshold})`,
 			);
 		}
 
@@ -456,20 +484,6 @@ export const statuslineCommand = define({
 						Result.unwrap({ blockInfo: 'No active block', burnRateInfo: '' }),
 					);
 
-					// Helper function to format context info with color coding
-					const formatContextInfo = (inputTokens: number, contextLimit: number): string => {
-						const percentage = Math.round((inputTokens / contextLimit) * 100);
-						const color =
-							percentage < ctx.values.contextLowThreshold
-								? pc.green
-								: percentage < ctx.values.contextMediumThreshold
-									? pc.yellow
-									: pc.red;
-						const coloredPercentage = color(`${percentage}%`);
-						const tokenDisplay = inputTokens.toLocaleString();
-						return `${tokenDisplay} (${coloredPercentage})`;
-					};
-
 					// Get context tokens from Claude Code hook data, or fall back to calculating from transcript
 					const contextDataResult =
 						hookData.context_window != null
@@ -500,7 +514,12 @@ export const statuslineCommand = define({
 							if (contextResult == null) {
 								return undefined;
 							}
-							return formatContextInfo(contextResult.inputTokens, contextResult.contextLimit);
+							return formatContextInfo(
+								contextResult.inputTokens,
+								contextResult.contextLimit,
+								contextLowThreshold,
+								contextMediumThreshold,
+							);
 						}),
 						Result.unwrap(undefined),
 					);
@@ -574,3 +593,13 @@ export const statuslineCommand = define({
 		}
 	},
 });
+
+if (import.meta.vitest != null) {
+	describe('getContextColorFormatter', () => {
+		it('uses the parsed threshold values supplied by the caller', () => {
+			expect(getContextColorFormatter(50, 60, 80)).toBe(pc.green);
+			expect(getContextColorFormatter(50, 40, 80)).toBe(pc.yellow);
+			expect(getContextColorFormatter(50, 20, 40)).toBe(pc.red);
+		});
+	});
+}

@@ -79,7 +79,7 @@
 		"mitata": "catalog:testing",
 		"p-limit": "catalog:runtime",
 		"path-type": "catalog:runtime",
-		"picocolors": "catalog:runtime",
+		"picospinner": "catalog:runtime",
 		"pretty-ms": "catalog:runtime",
 		"publint": "catalog:lint",
 		"tsdown": "catalog:build",

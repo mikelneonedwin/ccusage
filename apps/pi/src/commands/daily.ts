@@ -14,6 +14,7 @@ import { log, logger } from '../logger.ts';
 export const dailyCommand = define({
 	name: 'daily',
 	description: 'Show pi-agent usage by date',
+	toKebab: true,
 	args: {
 		json: {
 			type: 'boolean',
@@ -131,7 +132,14 @@ export const dailyCommand = define({
 			});
 			table.push(totalsRow);
 
-			log(table.toString());
+			const renderedTable = table.toString();
+			log(renderedTable);
+
+			if (table.isCompactMode()) {
+				log();
+				logger.info('Running in Compact Mode');
+				logger.info('Expand terminal width to see cache metrics and total tokens');
+			}
 		}
 	},
 });

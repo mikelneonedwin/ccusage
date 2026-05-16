@@ -164,11 +164,13 @@ export const sessionCommand = define({
 			); // Include Last Activity column
 			table.push(totalsRow);
 
-			await writeStdoutLine(table.toString());
+			const renderedTable = table.toString();
 
-			// Show guidance message if in compact mode
+			await writeStdoutLine(renderedTable);
+
 			if (table.isCompactMode()) {
-				logger.info('\nRunning in Compact Mode');
+				await writeStdoutLine();
+				logger.info('Running in Compact Mode');
 				logger.info('Expand terminal width to see cache metrics and total tokens');
 			}
 		}
