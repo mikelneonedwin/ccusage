@@ -2,7 +2,21 @@
 	"name": "@ccusage/pi",
 	"version": "18.0.11",
 	"description": "Deprecated compatibility package. Use npx ccusage instead.",
+	"homepage": "https://github.com/ryoppippi/ccusage#readme",
+	"bugs": {
+		"url": "https://github.com/ryoppippi/ccusage/issues"
+	},
 	"license": "MIT",
+	"author": "ryoppippi",
+	"contributors": [
+		"nicobailon"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ryoppippi/ccusage.git",
+		"directory": "apps/pi"
+	},
+	"funding": "https://github.com/ryoppippi/ccusage?sponsor=1",
 	"bin": {
 		"pi": "./index.js"
 	},

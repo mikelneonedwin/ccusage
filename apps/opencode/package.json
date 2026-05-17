@@ -2,7 +2,21 @@
 	"name": "@ccusage/opencode",
 	"version": "18.0.11",
 	"description": "Deprecated compatibility package. Use npx ccusage instead.",
+	"homepage": "https://github.com/ryoppippi/ccusage#readme",
+	"bugs": {
+		"url": "https://github.com/ryoppippi/ccusage/issues"
+	},
 	"license": "MIT",
+	"contributors": [
+		"ryoppippi",
+		"AnishDe12020"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ryoppippi/ccusage.git",
+		"directory": "apps/opencode"
+	},
+	"funding": "https://github.com/ryoppippi/ccusage?sponsor=1",
 	"bin": {
 		"ccusage-opencode": "./index.js"
 	},

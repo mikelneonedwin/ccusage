@@ -2,7 +2,18 @@
 	"name": "@ccusage/amp",
 	"version": "18.0.11",
 	"description": "Deprecated compatibility package. Use npx ccusage instead.",
+	"homepage": "https://github.com/ryoppippi/ccusage#readme",
+	"bugs": {
+		"url": "https://github.com/ryoppippi/ccusage/issues"
+	},
 	"license": "MIT",
+	"author": "ryoppippi",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ryoppippi/ccusage.git",
+		"directory": "apps/amp"
+	},
+	"funding": "https://github.com/ryoppippi/ccusage?sponsor=1",
 	"bin": {
 		"ccusage-amp": "./index.js"
 	},
