@@ -36,7 +36,7 @@ export default defineConfig({
 	},
 	outputOptions: {
 		comments: {
-			legal: true,
+			legal: false,
 			annotation: true,
 			jsdoc: false,
 		},
