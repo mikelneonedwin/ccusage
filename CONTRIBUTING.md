@@ -49,7 +49,7 @@ pnpm typecheck
 pnpm run test
 ```
 
-Use the canonical `ccusage` command in docs and tests. Deprecated compatibility wrappers such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` should not be promoted as the primary interface.
+Use the canonical `ccusage` command in docs and tests. Standalone wrapper packages such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` have been removed and should not be reintroduced.
 
 Do not proactively create documentation files unless the change requires user-facing documentation.
 

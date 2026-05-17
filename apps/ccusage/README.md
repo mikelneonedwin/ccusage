@@ -23,27 +23,9 @@
 
 > Analyze coding (agent) CLI token usage and costs from local data.
 
-## ccusage Family
-
-### 📊 [ccusage](https://www.npmjs.com/package/ccusage) - Coding (Agent) CLI Usage Analyzer
+## Supported Sources
 
 The main CLI tool for analyzing Claude Code, Codex, OpenCode, Amp, and pi-agent usage from local data. Track daily, weekly, monthly, and session-based usage with beautiful tables.
-
-### 🤖 [@ccusage/codex](https://www.npmjs.com/package/@ccusage/codex) - Codex Compatibility Wrapper
-
-Compatibility wrapper for OpenAI Codex usage. Prefer `ccusage codex` or `ccusage codex daily`.
-
-### 🚀 [@ccusage/opencode](https://www.npmjs.com/package/@ccusage/opencode) - OpenCode Compatibility Wrapper
-
-Compatibility wrapper for [OpenCode](https://github.com/opencode-ai/opencode) usage. Prefer `ccusage opencode`.
-
-### 🥧 [@ccusage/pi](https://www.npmjs.com/package/@ccusage/pi) - pi-agent Compatibility Wrapper
-
-Compatibility wrapper for [pi-agent](https://github.com/badlogic/pi-mono) usage. Prefer `ccusage pi`.
-
-### ⚡ [@ccusage/amp](https://www.npmjs.com/package/@ccusage/amp) - Amp Compatibility Wrapper
-
-Compatibility wrapper for [Amp](https://ampcode.com/) usage. Prefer `ccusage amp`.
 
 ## Installation
 
@@ -63,15 +45,6 @@ npx ccusage@latest
 
 > 💡 **Runtime**: `bunx ccusage` is recommended for everyday use. If you use `npx`, include `@latest` and use Node.js 22+.
 > Because the published CLI shebang targets Node.js, package runners can start ccusage under Node.js even when launched through `bunx`. When ccusage finds `bun` in `PATH`, it automatically re-runs the bundled entrypoint with Bun for better warm runtime performance. Set `CCUSAGE_BUN_AUTO_RUN=0` to force Node.js.
-
-### Compatibility Packages
-
-```bash
-npx @ccusage/codex@latest       # Deprecated wrapper for: ccusage codex
-npx @ccusage/opencode@latest    # Deprecated wrapper for: ccusage opencode
-npx @ccusage/pi@latest          # Deprecated wrapper for: ccusage pi
-npx @ccusage/amp@latest         # Deprecated wrapper for: ccusage amp
-```
 
 ## Usage
 

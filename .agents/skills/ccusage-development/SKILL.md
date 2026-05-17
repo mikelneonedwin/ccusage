@@ -10,10 +10,6 @@ description: Work in the ccusage monorepo with its unified ccusage command surfa
 This is a monorepo. Check the nearest package-specific `CLAUDE.md` before editing a package:
 
 - `apps/ccusage/CLAUDE.md` - main Claude Code usage CLI and library
-- `apps/codex/CLAUDE.md` - Codex usage tracking CLI
-- `apps/opencode/CLAUDE.md` - OpenCode usage tracking CLI
-- `apps/amp/CLAUDE.md` - Amp usage tracking CLI
-- `apps/pi/CLAUDE.md` - pi-agent usage tracking CLI
 - `docs/CLAUDE.md` - VitePress documentation site
 
 The canonical user-facing command is `ccusage` with agent subcommands:
@@ -26,9 +22,9 @@ ccusage amp daily
 ccusage pi daily
 ```
 
-Standalone agent binaries such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` are deprecated compatibility wrappers. Keep backward compatibility where it already exists, but prefer `ccusage <agent> ...` in docs, tests, examples, and new behavior.
+Standalone agent wrapper packages have been removed. Prefer `ccusage <agent> ...` in docs, tests, examples, and new behavior, and do not reintroduce wrapper commands such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, or `ccusage-pi`.
 
-Agent apps are still bundled runtime payloads. Treat runtime libraries as bundled assets: add dependencies to each app's `devDependencies` unless the user explicitly asks otherwise. Deprecated wrapper packages are the exception: keep install-time dependencies such as `ccusage` in `dependencies` when the wrapper needs them after installation.
+Agent implementations live inside the bundled `ccusage` package. Treat runtime libraries as bundled assets: add dependencies to each package's `devDependencies` unless the user explicitly asks otherwise.
 
 ## Common Commands
 
@@ -59,7 +55,7 @@ Tools are managed by `flake.nix` and `package.json`. Use `comma` or `nix run` fo
 - Use Gunshi for CLI commands; use the `use-gunshi-cli` skill for details.
 - Only export constants, functions, and types used by other modules.
 - Keep internal-only files and helpers private where possible.
-- Dependency additions go in `devDependencies` for bundled/private packages, but keep install-time wrapper dependencies in `dependencies`.
+- Dependency additions go in `devDependencies` for bundled/private packages.
 
 ## Post-Change Workflow
 

@@ -39,7 +39,7 @@ Use small files under each adapter directory:
 - `pricing.ts` or `pricing-macro.ts` - model aliases, provider filters, and bundled pricing.
 - `types.ts` - adapter-local types.
 
-Do not put new source logic in deprecated standalone packages. Those packages are compatibility wrappers; ccusage adapter directories are the implementation home.
+Do not put source logic outside the ccusage adapter directories. The standalone wrapper packages have been removed, and `apps/ccusage/src/adapter/<agent>/` is the implementation home.
 
 When migrating an existing root-level implementation into an adapter, update internal import sites to point at `adapter/<agent>/...` directly. Avoid root-level re-export shims unless the path is part of the package's declared public exports or a dedicated bundled worker entry. `apps/ccusage/src/data-loader.ts` is such an entry: it keeps the optimized Claude loader in the separate `data-loader` chunk introduced by PR #984, while source logic stays under `adapter/claude/`.
 

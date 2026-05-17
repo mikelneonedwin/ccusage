@@ -38,26 +38,6 @@ pre-commit:
             glob: '**/*'
             run: pnpm exec eslint --cache --fix --no-warn-ignored {staged_files}
             stage_fixed: true
-          - name: amp
-            root: apps/amp/
-            glob: '**/*'
-            run: pnpm exec eslint --cache --fix --no-warn-ignored {staged_files}
-            stage_fixed: true
-          - name: codex
-            root: apps/codex/
-            glob: '**/*'
-            run: pnpm exec eslint --cache --fix --no-warn-ignored {staged_files}
-            stage_fixed: true
-          - name: opencode
-            root: apps/opencode/
-            glob: '**/*'
-            run: pnpm exec eslint --cache --fix --no-warn-ignored {staged_files}
-            stage_fixed: true
-          - name: pi
-            root: apps/pi/
-            glob: '**/*'
-            run: pnpm exec eslint --cache --fix --no-warn-ignored {staged_files}
-            stage_fixed: true
           - name: internal
             root: packages/internal/
             glob: '**/*'

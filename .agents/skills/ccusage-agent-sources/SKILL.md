@@ -21,7 +21,7 @@ ccusage amp daily
 ccusage pi daily
 ```
 
-Standalone agent binaries such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` are deprecated compatibility wrappers. Preserve compatibility when needed, but do not promote standalone binaries in new docs, tests, or examples.
+Standalone agent wrapper packages have been removed. Use the unified `ccusage <agent> ...` commands in docs, tests, and examples, and do not reintroduce wrapper commands such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, or `ccusage-pi`.
 
 Cost modes:
 
@@ -46,13 +46,12 @@ Read only the relevant reference before changing parser behavior, token mappings
 - Treat Codex, OpenCode, Amp, and pi-agent as agent subcommands under the unified `ccusage` CLI.
 - Reuse shared packages such as `@ccusage/terminal`, `@ccusage/internal`, pricing helpers, and logging where appropriate.
 - Keep command names and flag semantics aligned unless the source data forces a difference.
-- Internal workspace runtime libraries for bundled/private agent apps belong in `devDependencies`.
-- Deprecated wrapper packages must keep install-time runtime dependencies such as `ccusage` in `dependencies`.
+- Internal workspace runtime libraries for bundled/private packages belong in `devDependencies`.
 
 ## Adapter Layout
 
 New or migrated agent implementations belong under `apps/ccusage/src/adapter/<agent>/`.
-Keep agent-specific code there, not in deprecated wrapper packages. Split files by responsibility when the implementation grows:
+Keep agent-specific code there. Split files by responsibility when the implementation grows:
 
 - `index.ts` - thin public adapter surface: `detect<Agent>()`, `load<Agent>Rows()`, and high-level wiring.
 - `paths.ts` - environment variables, default directories, and path discovery.
@@ -76,7 +75,7 @@ Before adding or changing an adapter, read `apps/ccusage/src/adapter/ARCHITECTUR
 For each migrated or new agent:
 
 - Put all source-specific runtime logic under `apps/ccusage/src/adapter/<agent>/`.
-- Keep deprecated wrapper packages as thin compatibility commands only.
+- Keep agent-specific package logic under `apps/ccusage/src/adapter/<agent>/`.
 - Implement fast detection that short-circuits once a usable source file is found.
 - Use shared file walking, JSONL byte marker scanning where applicable, worker gating, logging, pricing fetcher lifecycle, date formatting, table rendering, and all-agent aggregation.
 - Keep adapter code responsible for source paths, raw parsing, token mapping, model mapping, source metadata, and agent-specific pricing.

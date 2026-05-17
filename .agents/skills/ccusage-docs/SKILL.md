@@ -28,7 +28,7 @@ The docs build copies `apps/ccusage/config-schema.json` to `docs/public/config-s
 ## Content Rules
 
 - Prefer the unified command form in new or edited docs: `ccusage codex ...`, `ccusage opencode ...`, `ccusage amp ...`, and `ccusage pi ...`.
-- Standalone wrapper commands such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` are deprecated. Mention them only for migration or compatibility notes.
+- Standalone wrapper commands such as `ccusage-codex`, `ccusage-opencode`, `ccusage-amp`, and `ccusage-pi` have been removed. Do not promote or reintroduce them in docs.
 - Place screenshots immediately after the page H1 when a guide has a primary screenshot.
 - Use relative image paths such as `/screenshot.png` for files in `docs/public/`.
 - Always include descriptive alt text for screenshots and images.
