@@ -6,9 +6,11 @@
 		"node_modules",
 		"coverage",
 		".git",
-		".claude/settings.local.json"
+		".claude/settings.local.json",
+		"nix/models-dev-gen.ts"
 	],
-	"rules": {
-		"vitest/prefer-describe-function-title": "error"
+	"options": {
+		"typeAware": true,
+		"typeCheck": true
 	}
 }
