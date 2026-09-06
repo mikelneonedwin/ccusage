@@ -26027,7 +26027,7 @@
 			"output": 0.4
 		},
 		"limit": {
-			"context": 32768
+			"context": 1024000
 		}
 	},
 	"thinkingcap-qwen3.6-27b": {
