@@ -1882,6 +1882,16 @@
 			"context": 32000
 		}
 	},
+	"TheDrummer/Artemis-v1.1": {
+		"cost": {
+			"cache_read": 0.05,
+			"input": 0.1,
+			"output": 0.45
+		},
+		"limit": {
+			"context": 262144
+		}
+	},
 	"TheDrummer/Cydonia-24B-v2": {
 		"cost": {
 			"cache_read": 0.05015,
