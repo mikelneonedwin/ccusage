@@ -20469,10 +20469,22 @@
 	},
 	"openai-gpt-56-luna": {
 		"cost": {
-			"cache_read": 0.02666667,
-			"cache_write": 0.33333334,
-			"input": 0.26666667,
-			"output": 1.6
+			"cache_read": 0.025,
+			"cache_write": 0.3125,
+			"input": 0.25,
+			"output": 1.5,
+			"tiers": [
+				{
+					"cache_read": 0.05,
+					"cache_write": 0.625,
+					"input": 0.5,
+					"output": 2.25,
+					"tier": {
+						"size": 272000,
+						"type": "context"
+					}
+				}
+			]
 		},
 		"limit": {
 			"context": 1000000
@@ -20480,16 +20492,16 @@
 	},
 	"openai-gpt-56-luna-pro": {
 		"cost": {
-			"cache_read": 0.125,
-			"cache_write": 1.5625,
-			"input": 1.25,
-			"output": 7.5,
+			"cache_read": 0.025,
+			"cache_write": 0.3125,
+			"input": 0.25,
+			"output": 1.5,
 			"tiers": [
 				{
-					"cache_read": 0.25,
-					"cache_write": 3.125,
-					"input": 2.5,
-					"output": 11.25,
+					"cache_read": 0.05,
+					"cache_write": 0.625,
+					"input": 0.5,
+					"output": 2.25,
 					"tier": {
 						"size": 272000,
 						"type": "context"
@@ -29421,7 +29433,7 @@
 		},
 		"exactOnly": true,
 		"limit": {
-			"context": 1048576
+			"context": 262144
 		}
 	}
 }
