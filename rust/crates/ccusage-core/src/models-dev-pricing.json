@@ -21247,7 +21247,7 @@
 			"output": 10
 		},
 		"limit": {
-			"context": 1000000
+			"context": 400000
 		}
 	},
 	"openai/gpt-5.1-chat": {
@@ -29339,9 +29339,9 @@
 	},
 	"~deepseek/deepseek-v4-flash-latest": {
 		"cost": {
-			"cache_read": 0.009996,
-			"input": 0.04998,
-			"output": 0.09996
+			"cache_read": 0.009,
+			"input": 0.045,
+			"output": 0.09
 		},
 		"limit": {
 			"context": 1048576
