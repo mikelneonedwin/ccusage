@@ -8259,8 +8259,8 @@
 	},
 	"deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731": {
 		"cost": {
-			"cache_read": 0.016,
-			"input": 0.08,
+			"cache_read": 0.015,
+			"input": 0.06,
 			"output": 0.18
 		},
 		"limit": {
@@ -22932,8 +22932,8 @@
 	},
 	"qwen/deepseek-v4-flash-0731": {
 		"cost": {
-			"input": 0.352,
-			"output": 1.056
+			"input": 0.176,
+			"output": 0.528
 		},
 		"limit": {
 			"context": 1000000
@@ -22941,8 +22941,8 @@
 	},
 	"qwen/deepseek-v4-pro-0813": {
 		"cost": {
-			"input": 1.122,
-			"output": 3.366
+			"input": 0.5808,
+			"output": 1.7424
 		},
 		"limit": {
 			"context": 1000000
