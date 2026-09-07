@@ -12499,6 +12499,16 @@
 			"context": 1050000
 		}
 	},
+	"global.xai.grok-4.6": {
+		"cost": {
+			"cache_read": 0.5,
+			"input": 2,
+			"output": 6
+		},
+		"limit": {
+			"context": 500000
+		}
+	},
 	"gonka24/deepseek-v4-flash": {
 		"cost": {
 			"cache_read": 0.0097,
@@ -26673,6 +26683,16 @@
 			"context": 3500000
 		}
 	},
+	"us.xai.grok-4.6": {
+		"cost": {
+			"cache_read": 0.55,
+			"input": 2.2,
+			"output": 6.6
+		},
+		"limit": {
+			"context": 500000
+		}
+	},
 	"v0-1.0-md": {
 		"cost": {
 			"input": 3,
@@ -29325,9 +29345,9 @@
 	},
 	"~deepseek/deepseek-v4-flash-latest": {
 		"cost": {
-			"cache_read": 0.009,
-			"input": 0.045,
-			"output": 0.09
+			"cache_read": 0.013,
+			"input": 0.05,
+			"output": 0.16
 		},
 		"limit": {
 			"context": 1048576
