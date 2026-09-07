@@ -29469,13 +29469,13 @@
 	},
 	"~z-ai/glm-latest": {
 		"cost": {
-			"cache_read": 0.234,
-			"input": 1.17,
-			"output": 3.96
+			"cache_read": 0.208,
+			"input": 1.12,
+			"output": 3.52
 		},
 		"exactOnly": true,
 		"limit": {
-			"context": 262144
+			"context": 1048576
 		}
 	}
 }
