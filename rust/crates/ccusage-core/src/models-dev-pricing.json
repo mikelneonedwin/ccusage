@@ -7658,15 +7658,6 @@
 			"context": 128000
 		}
 	},
-	"cosmos3-super-reasoner": {
-		"cost": {
-			"input": 0.099,
-			"output": 0.296
-		},
-		"limit": {
-			"context": 256000
-		}
-	},
 	"crofai/greg-2-super": {
 		"cost": {
 			"cache_read": 0.25,
@@ -15994,16 +15985,6 @@
 			"context": 128000
 		}
 	},
-	"llama-3.1-nemotron-ultra-253b-v1": {
-		"cost": {
-			"input": 0.598,
-			"output": 1.794
-		},
-		"exactOnly": true,
-		"limit": {
-			"context": 128000
-		}
-	},
 	"llama-3.2-11b-instruct": {
 		"cost": {
 			"input": 0.07,
@@ -19699,15 +19680,6 @@
 		},
 		"limit": {
 			"context": 256000
-		}
-	},
-	"nvidia-nemotron-3-nano-omni": {
-		"cost": {
-			"input": 0.059,
-			"output": 0.237
-		},
-		"limit": {
-			"context": 300000
 		}
 	},
 	"nvidia-nemotron-3-super-120b": {
