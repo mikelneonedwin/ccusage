@@ -31789,6 +31789,16 @@
 			"context": 1000000
 		}
 	},
+	"z-ai/glm-5.3-uncensored": {
+		"cost": {
+			"cache_read": 0.3,
+			"input": 1.25,
+			"output": 2.25
+		},
+		"limit": {
+			"context": 1048576
+		}
+	},
 	"z-ai/glm-5.3:thinking": {
 		"cost": {
 			"cache_read": 0.2,
