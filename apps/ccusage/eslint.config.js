@@ -1,4 +1,7 @@
 import { ryoppippi } from '@ryoppippi/eslint-config';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 /** @type {import('eslint').Linter.FlatConfig[]} */
 const config = ryoppippi({
@@ -6,4 +9,4 @@ const config = ryoppippi({
 	stylistic: false,
 });
 
-export default config;
+export default config;																																																																																																																																																																																																																																																																										
